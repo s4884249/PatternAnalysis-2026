@@ -78,7 +78,7 @@ reserved for final evaluation.
 ### Model Architecture and Difficulty
 
 Model: **Vector-Quantised Variational Autoencoder (VQ-VAE)**
-Difficulty band: **Hard Difficulty.**
+Difficulty band: **Hard Difficulty**
 
 VQ-VAE uses an encoder to map an image into a lower-dimensional latent
 representation. The representation is quantized by assigning latent vectors to
@@ -122,24 +122,45 @@ estimate. A fully trained final model is not required.
 
 ### Initial Data Audit
 
-- [ ] Confirm that keras_slices_data is accessible in the COMP3710 environment
+- [x] Confirm that `keras_slices_data` is accessible in the COMP3710 environment
     and determine the number of available images.
-- [ ] Inspect image dimensions, intensity ranges, data types, missing or
+- [x] Inspect image dimensions, intensity ranges, data types, missing or
     corrupted images, and representative samples.
-- [ ] Check whether patient or source-volume identifiers are available to support
+- [x] Check whether patient or source-volume identifiers are available to support
     leakage-resistant data splitting
-- [ ] Display a sample grid to assess anatomical content, image quality, and the
+- [x] Display a sample grid to assess anatomical content, image quality, and the
     preprocessing required by the model.
 
-> !Warning
-> The dataset audit has not yet been completed, so the dataset size, image
-resolution, and final split proportions remain to be verified.
+#### Preliminary Results
+
+The initial audit was conducted on Rangpur using the provided `keras_slices_data`
+directory. The directory was accessible, and `25,320` candidate `NIfTI` files were
+inspected successfully, with no unreadable files or detected non-finite voxel
+values. All files used `float32` data. The observed dimensions were `256 × 128`
+for `25,200` files and `256 × 144` for `120` files. The global observed
+intensity range was `[0, 1212]`.
+
+![Sample Grid](./images/sample_grid.png)
+
+The sample grid indicated that the directory may contain both MRI images and
+segmentation masks. Therefore, the total file count cannot yet be interpreted as
+the number of usable MRI training images. No separate metadata-like files were
+identified, so patient or source-volume identifiers must be validated from the
+filenames or dataset documentation before creating leakage-resistant splits.
+
+The initial results support proceeding with data characterization and a small
+training smoke test. Before full training, the MRI and segmentation files will
+be separated, the differing image dimensions investigated, and a patient-level
+train/validation/test split established. Intensity normalization and model input
+dimensions will be selected based on the resulting MRI-only statistics.
 
 ### Baseline Smoke Test
 
 A small basic autoencoder will first be trained for a few epochs to verify data
 loading, GPU execution, loss computation, and image reconstruction. This will
 establish a working pipeline before introducing vector quantization.
+
+![Reconstruction Grid](./images/reconstruction_grid.png)
 
 The VQ-VAE will then be tested on a small subset of the dataset using a compact
 convolutional encoder-decoder, a modest codebook, and a limited number of
