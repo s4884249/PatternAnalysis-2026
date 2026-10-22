@@ -4,7 +4,6 @@ Examples are in README.md. The test split is evaluated once, after checkpoint
 selection using validation SSIM. VQ-VAE synthetic sampling additionally trains
 a small autoregressive prior on training-split code maps only.
 """
-
 from __future__ import annotations
 
 import argparse
@@ -21,13 +20,7 @@ import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, TensorDataset
 
-from dataset import (
-    NiftiSliceDataset,
-    all_groups_verified,
-    load_manifest,
-    split_by_group,
-    split_from_manifest,
-)
+from dataset import NiftiSliceDataset, all_groups_verified, load_manifest, split_by_group, split_from_manifest
 from modules import CodePrior, VQVAE, build_model, count_parameters
 
 
@@ -52,21 +45,22 @@ def get_device(requested: str) -> torch.device:
 
 
 def load_batch(batch: Dict[str, object], device: torch.device) -> torch.Tensor:
-    return batch["image"].to(
-        device=device, dtype=torch.float32, non_blocking=(device.type == "cuda")
-    )
+    return batch["image"].to(device=device, dtype=torch.float32, non_blocking=(device.type == "cuda"))
 
 
-def compute_loss(
-    model, images: torch.Tensor, model_type: str
-) -> Tuple[torch.Tensor, Dict[str, float], Dict[str, torch.Tensor]]:
+def compute_loss(model, images: torch.Tensor, model_type: str) -> Tuple[torch.Tensor, Dict[str, float], Dict[str, torch.Tensor]]:
     output = model(images)
     reconstruction_loss = F.mse_loss(output["reconstruction"], images)
     if model_type == "ae":
-        total_loss = reconstruction_loss
+        kl_loss = output.get("kl_loss", torch.zeros((), device=images.device))
+        kl_beta = float(getattr(model, "kl_beta", 0.0))
+        weighted_kl_loss = kl_beta * kl_loss
+        total_loss = reconstruction_loss + weighted_kl_loss
         codebook_loss = torch.zeros((), device=images.device)
         commitment_loss = torch.zeros((), device=images.device)
     else:
+        kl_loss = torch.zeros((), device=images.device)
+        weighted_kl_loss = torch.zeros((), device=images.device)
         codebook_loss = output["codebook_loss"]
         commitment_loss = output["commitment_loss"]
         total_loss = reconstruction_loss + codebook_loss + commitment_loss
@@ -75,12 +69,10 @@ def compute_loss(
         "reconstruction_mse": float(reconstruction_loss.detach().item()),
         "codebook_loss": float(codebook_loss.detach().item()),
         "commitment_loss": float(commitment_loss.detach().item()),
-        "perplexity": float(output["perplexity"].detach().item())
-        if model_type == "vqvae"
-        else float("nan"),
-        "active_codes": float(output["active_codes"].detach().item())
-        if model_type == "vqvae"
-        else float("nan"),
+        "kl_loss": float(kl_loss.detach().item()),
+        "weighted_kl_loss": float(weighted_kl_loss.detach().item()),
+        "perplexity": float(output["perplexity"].detach().item()) if model_type == "vqvae" else float("nan"),
+        "active_codes": float(output["active_codes"].detach().item()) if model_type == "vqvae" else float("nan"),
     }
     return total_loss, stats, output
 
@@ -91,15 +83,7 @@ def per_image_ssim(reconstructions: torch.Tensor, images: torch.Tensor) -> List[
     recon = reconstructions.detach().float().clamp(0, 1).cpu().numpy()[:, 0]
     real = images.detach().float().clamp(0, 1).cpu().numpy()[:, 0]
     return [
-        float(
-            structural_similarity(
-                real[i],
-                recon[i],
-                data_range=1.0,
-                gaussian_weights=True,
-                use_sample_covariance=False,
-            )
-        )
+        float(structural_similarity(real[i], recon[i], data_range=1.0, gaussian_weights=True, use_sample_covariance=False))
         for i in range(len(real))
     ]
 
@@ -113,13 +97,9 @@ def evaluate_model(
 ) -> Dict[str, float]:
     model.eval()
     sums: Dict[str, float] = {
-        "loss": 0.0,
-        "reconstruction_mse": 0.0,
-        "codebook_loss": 0.0,
-        "commitment_loss": 0.0,
-        "ssim": 0.0,
-        "perplexity": 0.0,
-        "active_codes": 0.0,
+        "loss": 0.0, "reconstruction_mse": 0.0, "codebook_loss": 0.0,
+        "commitment_loss": 0.0, "kl_loss": 0.0, "weighted_kl_loss": 0.0,
+        "ssim": 0.0, "perplexity": 0.0, "active_codes": 0.0,
     }
     n_images = 0
     with torch.inference_mode():
@@ -131,21 +111,14 @@ def evaluate_model(
             ssims = per_image_ssim(output["reconstruction"], images)
             batch_size = int(images.shape[0])
             n_images += batch_size
-            for key in (
-                "loss",
-                "reconstruction_mse",
-                "codebook_loss",
-                "commitment_loss",
-            ):
+            for key in ("loss", "reconstruction_mse", "codebook_loss", "commitment_loss", "kl_loss", "weighted_kl_loss"):
                 sums[key] += stats[key] * batch_size
             sums["ssim"] += float(np.sum(ssims))
             if model_type == "vqvae":
                 sums["perplexity"] += stats["perplexity"] * batch_size
                 sums["active_codes"] += stats["active_codes"] * batch_size
     if n_images == 0:
-        raise RuntimeError(
-            "Evaluation loader produced no images; check split and limit settings."
-        )
+        raise RuntimeError("Evaluation loader produced no images; check split and limit settings.")
     result = {key: value / n_images for key, value in sums.items()}
     result["n_images"] = int(n_images)
     return result
@@ -160,14 +133,7 @@ def train_one_epoch(
     max_batches: int = 0,
 ) -> Dict[str, float]:
     model.train()
-    keys = [
-        "loss",
-        "reconstruction_mse",
-        "codebook_loss",
-        "commitment_loss",
-        "perplexity",
-        "active_codes",
-    ]
+    keys = ["loss", "reconstruction_mse", "codebook_loss", "commitment_loss", "kl_loss", "weighted_kl_loss", "perplexity", "active_codes"]
     sums = {key: 0.0 for key in keys}
     n_images = 0
     for batch_index, batch in enumerate(loader):
@@ -177,9 +143,7 @@ def train_one_epoch(
         optimizer.zero_grad(set_to_none=True)
         loss, stats, _ = compute_loss(model, images, model_type)
         if not torch.isfinite(loss):
-            raise FloatingPointError(
-                f"Non-finite loss at batch {batch_index}: {loss.item()}"
-            )
+            raise FloatingPointError(f"Non-finite loss at batch {batch_index}: {loss.item()}")
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
         optimizer.step()
@@ -190,9 +154,7 @@ def train_one_epoch(
             if math.isfinite(value):
                 sums[key] += value * n
     if n_images == 0:
-        raise RuntimeError(
-            "Training loader produced no images; check the manifest and split."
-        )
+        raise RuntimeError("Training loader produced no images; check the manifest and split.")
     return {key: sums[key] / n_images for key in keys} | {"n_images": n_images}
 
 
@@ -215,27 +177,18 @@ def write_history_csv(path: Path, rows: Sequence[Dict[str, object]]) -> None:
 
 def plot_history(run_dir: Path, history: Sequence[Dict[str, object]]) -> None:
     import matplotlib
-
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
     epochs = [int(row["epoch"]) for row in history]
     fig, axes = plt.subplots(1, 2, figsize=(11, 4))
-    axes[0].plot(
-        epochs, [float(row["train_loss"]) for row in history], label="train total loss"
-    )
-    axes[0].plot(
-        epochs,
-        [float(row["val_loss"]) for row in history],
-        label="validation total loss",
-    )
+    axes[0].plot(epochs, [float(row["train_loss"]) for row in history], label="train total loss")
+    axes[0].plot(epochs, [float(row["val_loss"]) for row in history], label="validation total loss")
     axes[0].set_xlabel("Epoch")
     axes[0].set_ylabel("Loss")
     axes[0].legend()
     axes[0].grid(alpha=0.2)
-    axes[1].plot(
-        epochs, [float(row["val_ssim"]) for row in history], label="validation SSIM"
-    )
+    axes[1].plot(epochs, [float(row["val_ssim"]) for row in history], label="validation SSIM")
     axes[1].axhline(0.6, linestyle="--", label="assignment target 0.6")
     axes[1].set_xlabel("Epoch")
     axes[1].set_ylabel("SSIM")
@@ -247,20 +200,13 @@ def plot_history(run_dir: Path, history: Sequence[Dict[str, object]]) -> None:
 
 
 def make_loaders(
-    splits: Dict[str, List[Dict[str, str]]],
-    data_root: Path,
-    image_height: int,
-    image_width: int,
-    batch_size: int,
-    workers: int,
-    seed: int,
+    splits: Dict[str, List[Dict[str, str]]], data_root: Path, image_height: int, image_width: int,
+    batch_size: int, workers: int, seed: int,
 ) -> Dict[str, DataLoader]:
     generator = torch.Generator().manual_seed(seed)
     loaders = {}
     for name, rows in splits.items():
-        dataset = NiftiSliceDataset(
-            rows, data_root, image_height=image_height, image_width=image_width
-        )
+        dataset = NiftiSliceDataset(rows, data_root, image_height=image_height, image_width=image_width)
         loaders[name] = DataLoader(
             dataset,
             batch_size=batch_size,
@@ -274,87 +220,32 @@ def make_loaders(
     return loaders
 
 
-def save_checkpoint(
-    path: Path,
-    model,
-    args,
-    epoch: int,
-    val_metrics: Dict[str, float],
-    parameter_count: int,
-) -> None:
+def save_checkpoint(path: Path, model, args, epoch: int, val_metrics: Dict[str, float], parameter_count: int) -> None:
     config = {
         "base_channels": args.base_channels,
         "latent_dim": args.latent_dim,
         "codebook_size": args.codebook_size,
         "commitment_beta": args.commitment_beta,
+        "ae_latent_mode": args.ae_latent_mode,
+        "ae_kl_beta": args.ae_kl_beta,
         "image_height": args.image_height,
         "image_width": args.image_width,
         "data_root": str(args.data_root.resolve()),
         "manifest": str(args.manifest.resolve()),
         "seed": args.seed,
     }
-    torch.save(
-        {
-            "model_type": args.model,
-            "model_config": config,
-            "model_state_dict": model.state_dict(),
-            "epoch": int(epoch),
-            "validation_metrics": val_metrics,
-            "parameter_count": int(parameter_count),
-        },
-        path,
-    )
+    torch.save({
+        "model_type": args.model,
+        "model_config": config,
+        "model_state_dict": model.state_dict(),
+        "epoch": int(epoch),
+        "validation_metrics": val_metrics,
+        "parameter_count": int(parameter_count),
+    }, path)
 
 
 @torch.inference_mode()
-def fit_ae_latent_prior(
-    model, loader, device: torch.device, output_path: Path, max_batches: int = 0
-) -> None:
-    """Fit an intentionally simple channel-wise diagonal Gaussian to AE latents.
-
-    A deterministic AE does not provide a probabilistic sampling prior. This
-    weak sampler is used only as an explicitly limited generation comparator;
-    it is not part of the AE reconstruction training objective.
-    """
-    model.eval()
-    total = None
-    total_sq = None
-    count = 0
-    for batch_index, batch in enumerate(loader):
-        if max_batches and batch_index >= max_batches:
-            break
-        images = load_batch(batch, device)
-        z = model.encode(images).double()
-        dims = (0, 2, 3)
-        z_sum = z.sum(dim=dims)
-        z_sq = z.square().sum(dim=dims)
-        if total is None:
-            total, total_sq = z_sum, z_sq
-        else:
-            total += z_sum
-            total_sq += z_sq
-        count += z.shape[0] * z.shape[2] * z.shape[3]
-    if count == 0:
-        raise RuntimeError(
-            "Could not estimate AE latent statistics from an empty loader"
-        )
-    mean = total / count
-    variance = (total_sq / count - mean.square()).clamp_min(1e-6)
-    std = variance.sqrt().clamp_min(1e-3)
-    torch.save(
-        {
-            "mean": mean.float().view(1, -1, 1, 1),
-            "std": std.float().view(1, -1, 1, 1),
-            "count": count,
-        },
-        output_path,
-    )
-
-
-@torch.inference_mode()
-def collect_code_maps(
-    model: VQVAE, loader: DataLoader, device: torch.device, max_batches: int = 0
-) -> torch.Tensor:
+def collect_code_maps(model: VQVAE, loader: DataLoader, device: torch.device, max_batches: int = 0) -> torch.Tensor:
     model.eval()
     maps = []
     for batch_index, batch in enumerate(loader):
@@ -376,12 +267,8 @@ def train_code_prior(
 ) -> Dict[str, object]:
     code_maps = collect_code_maps(model, train_loader, device, args.limit_train_batches)
     dataset = TensorDataset(code_maps)
-    loader = DataLoader(
-        dataset, batch_size=args.batch_size, shuffle=True, num_workers=0
-    )
-    prior = CodePrior(
-        codebook_size=args.codebook_size, hidden_channels=args.prior_hidden
-    ).to(device)
+    loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, num_workers=0)
+    prior = CodePrior(codebook_size=args.codebook_size, hidden_channels=args.prior_hidden).to(device)
     optimizer = torch.optim.Adam(prior.parameters(), lr=args.prior_lr)
     prior_history = []
     start = time.perf_counter()
@@ -393,10 +280,7 @@ def train_code_prior(
             indices = indices.to(device=device, dtype=torch.long)
             optimizer.zero_grad(set_to_none=True)
             logits = prior(indices)
-            loss = F.cross_entropy(
-                logits.permute(0, 2, 3, 1).reshape(-1, args.codebook_size),
-                indices.reshape(-1),
-            )
+            loss = F.cross_entropy(logits.permute(0, 2, 3, 1).reshape(-1, args.codebook_size), indices.reshape(-1))
             if not torch.isfinite(loss):
                 raise FloatingPointError(f"Non-finite code-prior loss at epoch {epoch}")
             loss.backward()
@@ -407,53 +291,34 @@ def train_code_prior(
             count += n
         epoch_loss = total_loss / max(1, count)
         prior_history.append({"epoch": epoch, "train_cross_entropy": epoch_loss})
-        print(
-            f"[prior] epoch {epoch:03d}/{args.prior_epochs:03d} | train CE={epoch_loss:.5f}"
-        )
+        print(f"[prior] epoch {epoch:03d}/{args.prior_epochs:03d} | train CE={epoch_loss:.5f}")
     elapsed = time.perf_counter() - start
-    torch.save(
-        {
-            "state_dict": prior.state_dict(),
-            "codebook_size": args.codebook_size,
-            "hidden_channels": args.prior_hidden,
-            "latent_height": int(code_maps.shape[1]),
-            "latent_width": int(code_maps.shape[2]),
-            "train_examples": int(code_maps.shape[0]),
-            "history": prior_history,
-        },
-        run_dir / "prior.pt",
-    )
+    torch.save({
+        "state_dict": prior.state_dict(),
+        "codebook_size": args.codebook_size,
+        "hidden_channels": args.prior_hidden,
+        "latent_height": int(code_maps.shape[1]),
+        "latent_width": int(code_maps.shape[2]),
+        "train_examples": int(code_maps.shape[0]),
+        "history": prior_history,
+    }, run_dir / "prior.pt")
     write_history_csv(run_dir / "prior_history.csv", prior_history)
     return {
         "train_code_maps": int(code_maps.shape[0]),
         "latent_shape": list(code_maps.shape[1:]),
         "prior_parameters": count_parameters(prior),
         "prior_training_seconds": elapsed,
-        "final_train_cross_entropy": prior_history[-1]["train_cross_entropy"]
-        if prior_history
-        else None,
+        "final_train_cross_entropy": prior_history[-1]["train_cross_entropy"] if prior_history else None,
     }
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(
-        description="Train a basic AE baseline or a VQ-VAE on 2D HipMRI NIfTI slices"
-    )
+    parser = argparse.ArgumentParser(description="Train a basic AE baseline or a VQ-VAE on 2D HipMRI NIfTI slices")
     parser.add_argument("--model", choices=("ae", "vqvae"), required=True)
-    parser.add_argument(
-        "--data-root",
-        type=Path,
-        default=Path("/home/groups/comp3710/HipMRI_Study_open/keras_slices_data"),
-    )
-    parser.add_argument(
-        "--manifest", type=Path, required=True, help="CSV created by dataset.py audit"
-    )
-    parser.add_argument(
-        "--split-mode",
-        choices=("predefined", "grouped"),
-        default="predefined",
-        help="Use the existing keras_slices_{train,validate,test} folders (default), or create a new group split",
-    )
+    parser.add_argument("--data-root", type=Path, default=Path("/home/groups/comp3710/HipMRI_Study_open/keras_slices_data"))
+    parser.add_argument("--manifest", type=Path, required=True, help="CSV created by dataset.py audit")
+    parser.add_argument("--split-mode", choices=("predefined", "grouped"), default="predefined",
+                        help="Use the existing keras_slices_{train,validate,test} folders (default), or create a new group split")
     parser.add_argument("--run-dir", type=Path, required=True)
     parser.add_argument("--device", default="auto", help="auto, cpu, cuda, or cuda:0")
     parser.add_argument("--epochs", type=int, default=50)
@@ -467,45 +332,26 @@ def main() -> None:
     parser.add_argument("--latent-dim", type=int, default=64)
     parser.add_argument("--codebook-size", type=int, default=256)
     parser.add_argument("--commitment-beta", type=float, default=0.25)
+    parser.add_argument("--ae-latent-mode", choices=("gaussian", "deterministic"), default="gaussian",
+                        help="AE only: gaussian learns to decode random N(0,1) latent maps; deterministic is reconstruction-only")
+    parser.add_argument("--ae-kl-beta", type=float, default=0.1,
+                        help="AE only: KL regularization strength for the Gaussian latent mode")
     parser.add_argument("--prior-epochs", type=int, default=15)
     parser.add_argument("--prior-hidden", type=int, default=64)
     parser.add_argument("--prior-lr", type=float, default=2e-4)
-    parser.add_argument(
-        "--include-unknown",
-        action="store_true",
-        help="Include kind=unknown after manually auditing the manifest",
-    )
-    parser.add_argument(
-        "--allow-unverified-groups",
-        action="store_true",
-        help="Unsafe override; use only for pipeline smoke tests",
-    )
-    parser.add_argument(
-        "--limit-train-batches",
-        type=int,
-        default=0,
-        help="Debug only: cap train batches/epoch; 0 means all",
-    )
-    parser.add_argument(
-        "--limit-val-batches",
-        type=int,
-        default=0,
-        help="Debug only: cap validation batches; 0 means all",
-    )
-    parser.add_argument(
-        "--limit-test-batches",
-        type=int,
-        default=0,
-        help="Debug only: cap test batches; 0 means all",
-    )
+    parser.add_argument("--include-unknown", action="store_true", help="Include kind=unknown after manually auditing the manifest")
+    parser.add_argument("--allow-unverified-groups", action="store_true", help="Unsafe override; use only for pipeline smoke tests")
+    parser.add_argument("--limit-train-batches", type=int, default=0, help="Debug only: cap train batches/epoch; 0 means all")
+    parser.add_argument("--limit-val-batches", type=int, default=0, help="Debug only: cap validation batches; 0 means all")
+    parser.add_argument("--limit-test-batches", type=int, default=0, help="Debug only: cap test batches; 0 means all")
     args = parser.parse_args()
 
     if args.epochs < 1 or args.batch_size < 1 or args.workers < 0:
         parser.error("epochs/batch-size must be positive and workers non-negative")
+    if args.ae_kl_beta < 0:
+        parser.error("ae-kl-beta cannot be negative")
     if args.model == "vqvae" and args.prior_epochs < 1:
-        parser.error(
-            "VQ-VAE sampling requires --prior-epochs >= 1 to train the code-index prior"
-        )
+        parser.error("VQ-VAE sampling requires --prior-epochs >= 1 to train the code-index prior")
     args.data_root = args.data_root.expanduser().resolve()
     args.manifest = args.manifest.expanduser().resolve()
     args.run_dir = args.run_dir.expanduser().resolve()
@@ -516,9 +362,7 @@ def main() -> None:
     if device.type == "cuda":
         print(f"GPU: {torch.cuda.get_device_name(device)}")
 
-    rows = load_manifest(
-        args.manifest, args.data_root, include_unknown=args.include_unknown
-    )
+    rows = load_manifest(args.manifest, args.data_root, include_unknown=args.include_unknown)
     groups_verified = all_groups_verified(rows)
     if args.split_mode == "grouped":
         if not groups_verified and not args.allow_unverified_groups:
@@ -534,12 +378,8 @@ def main() -> None:
     else:
         splits = split_from_manifest(rows)
         split_source = "predefined_directory_split"
-        print(
-            "Split source: existing keras_slices_train / keras_slices_validate / keras_slices_test folders"
-        )
-        print(
-            "Segmentation masks in keras_slices_seg_* folders are excluded from the MRI experiment."
-        )
+        print("Split source: existing keras_slices_train / keras_slices_validate / keras_slices_test folders")
+        print("Segmentation masks in keras_slices_seg_* folders are excluded from the MRI experiment.")
 
     split_json = {
         "seed": args.seed,
@@ -549,32 +389,24 @@ def main() -> None:
         "manifest": str(args.manifest),
         "group_id_verified": groups_verified,
         "case_ids_disjoint_across_splits": True,
-        "split_group_counts": {
-            k: len({row["group_id"] for row in values}) for k, values in splits.items()
-        },
+        "split_group_counts": {k: len({row["group_id"] for row in values}) for k, values in splits.items()},
         "split_image_counts": {k: len(values) for k, values in splits.items()},
         "splits": {k: values for k, values in splits.items()},
     }
     save_json(args.run_dir / "split.json", split_json)
     loaders = make_loaders(
-        splits,
-        args.data_root,
-        args.image_height,
-        args.image_width,
-        args.batch_size,
-        args.workers,
-        args.seed,
+        splits, args.data_root, args.image_height, args.image_width, args.batch_size, args.workers, args.seed
     )
     if any(len(loaders[name].dataset) == 0 for name in ("train", "val", "test")):
-        raise RuntimeError(
-            f"At least one split is empty: {split_json['split_image_counts']}"
-        )
+        raise RuntimeError(f"At least one split is empty: {split_json['split_image_counts']}")
 
     model_config = {
         "base_channels": args.base_channels,
         "latent_dim": args.latent_dim,
         "codebook_size": args.codebook_size,
         "commitment_beta": args.commitment_beta,
+        "ae_latent_mode": args.ae_latent_mode if args.model == "ae" else "deterministic",
+        "ae_kl_beta": args.ae_kl_beta,
     }
     model = build_model(args.model, model_config).to(device)
     n_parameters = count_parameters(model)
@@ -589,27 +421,24 @@ def main() -> None:
     for epoch in range(1, args.epochs + 1):
         epoch_start = time.perf_counter()
         train_metrics = train_one_epoch(
-            model,
-            loaders["train"],
-            optimizer,
-            args.model,
-            device,
-            args.limit_train_batches,
+            model, loaders["train"], optimizer, args.model, device, args.limit_train_batches
         )
-        val_metrics = evaluate_model(
-            model, loaders["val"], args.model, device, args.limit_val_batches
-        )
+        val_metrics = evaluate_model(model, loaders["val"], args.model, device, args.limit_val_batches)
         epoch_seconds = time.perf_counter() - epoch_start
         row: Dict[str, object] = {
             "epoch": epoch,
             "train_loss": train_metrics["loss"],
             "train_reconstruction_mse": train_metrics["reconstruction_mse"],
+            "train_kl_loss": train_metrics["kl_loss"],
+            "train_weighted_kl_loss": train_metrics["weighted_kl_loss"],
             "train_codebook_loss": train_metrics["codebook_loss"],
             "train_commitment_loss": train_metrics["commitment_loss"],
             "train_perplexity": train_metrics["perplexity"],
             "train_active_codes": train_metrics["active_codes"],
             "val_loss": val_metrics["loss"],
             "val_reconstruction_mse": val_metrics["reconstruction_mse"],
+            "val_kl_loss": val_metrics["kl_loss"],
+            "val_weighted_kl_loss": val_metrics["weighted_kl_loss"],
             "val_ssim": val_metrics["ssim"],
             "val_perplexity": val_metrics["perplexity"],
             "val_active_codes": val_metrics["active_codes"],
@@ -624,54 +453,40 @@ def main() -> None:
         write_history_csv(args.run_dir / "history.csv", history)
         if val_metrics["ssim"] > best_val_ssim:
             best_val_ssim = val_metrics["ssim"]
-            save_checkpoint(
-                args.run_dir / "best.pt", model, args, epoch, val_metrics, n_parameters
-            )
+            save_checkpoint(args.run_dir / "best.pt", model, args, epoch, val_metrics, n_parameters)
             save_json(args.run_dir / "best_validation_metrics.json", val_metrics)
 
     training_seconds = time.perf_counter() - train_start
     plot_history(args.run_dir, history)
-    checkpoint = torch.load(
-        args.run_dir / "best.pt", map_location=device, weights_only=True
-    )
+    checkpoint = torch.load(args.run_dir / "best.pt", map_location=device, weights_only=True)
     model.load_state_dict(checkpoint["model_state_dict"])
-    test_metrics = evaluate_model(
-        model, loaders["test"], args.model, device, args.limit_test_batches
-    )
+    test_metrics = evaluate_model(model, loaders["test"], args.model, device, args.limit_test_batches)
     save_json(args.run_dir / "test_metrics.json", test_metrics)
 
-    # The baseline gets a weak empirical diagonal-Gaussian latent sampler; the VQ-VAE gets a
-    # learned autoregressive prior trained on training-split code maps only.
+    # Gaussian AE learns a prior-matched latent distribution; deterministic AE remains
+    # available as a reconstruction-only ablation. VQ-VAE uses a learned discrete prior.
     extra: Dict[str, object] = {}
     if args.model == "ae":
-        fit_ae_latent_prior(
-            model,
-            loaders["train"],
-            device,
-            args.run_dir / "ae_latent_prior.pt",
-            args.limit_train_batches,
-        )
+        extra["ae_latent_mode"] = args.ae_latent_mode
+        extra["ae_kl_beta"] = args.ae_kl_beta if args.ae_latent_mode == "gaussian" else None
         extra["generation_prior"] = (
-            "channel-wise diagonal Gaussian fit to training latent activations (weak baseline only)"
+            "independent standard-normal spatial latent maps; trained with a Gaussian posterior and KL regularization"
+            if args.ae_latent_mode == "gaussian" else
+            "no learned prior; deterministic AE is reconstruction-only and uses local latent interpolation for diagnostics"
         )
+        extra["generation_prior_parameters"] = 0
     else:
-        extra.update(
-            train_code_prior(model, loaders["train"], args, device, args.run_dir)
-        )
-        extra["generation_prior"] = (
-            "PixelCNN-like autoregressive prior trained on training-split code maps"
-        )
+        extra.update(train_code_prior(model, loaders["train"], args, device, args.run_dir))
+        extra["generation_prior"] = "PixelCNN-like autoregressive prior trained on training-split code maps"
 
     peak_memory_mb = None
     if device.type == "cuda":
-        peak_memory_mb = float(torch.cuda.max_memory_allocated(device) / (1024**2))
+        peak_memory_mb = float(torch.cuda.max_memory_allocated(device) / (1024 ** 2))
     final_summary = {
         "model": args.model,
         "model_parameters": n_parameters,
         "device": str(device),
-        "gpu_name": torch.cuda.get_device_name(device)
-        if device.type == "cuda"
-        else None,
+        "gpu_name": torch.cuda.get_device_name(device) if device.type == "cuda" else None,
         "seed": args.seed,
         "group_id_verified": groups_verified,
         "split_group_counts": split_json["split_group_counts"],
@@ -679,31 +494,26 @@ def main() -> None:
         "epochs_requested": args.epochs,
         "best_epoch": int(checkpoint["epoch"]),
         "training_wall_seconds": training_seconds,
-        "total_training_plus_prior_wall_seconds": training_seconds
-        + float(extra.get("prior_training_seconds", 0.0) or 0.0),
+        "total_training_plus_prior_wall_seconds": training_seconds + float(extra.get("prior_training_seconds", 0.0) or 0.0),
         "peak_cuda_memory_mb": peak_memory_mb,
         "best_validation_metrics": checkpoint["validation_metrics"],
         "held_out_test_metrics": test_metrics,
         "generation": extra,
         "notes": [
-            (
-                "The predefined directory split was preserved and case IDs were checked for overlap; verify the case-ID semantics against dataset documentation before making a formal patient-independent evaluation claim."
-                if args.split_mode == "predefined"
-                else "Test metrics are final only when the manifest and source-group mapping have been verified."
-            ),
+            ("The predefined directory split was preserved and case IDs were checked for overlap; verify the case-ID semantics against dataset documentation before making a formal patient-independent evaluation claim."
+             if args.split_mode == "predefined" else
+             "Test metrics are final only when the manifest and source-group mapping have been verified."),
             "SSIM here measures paired input/reconstruction similarity, not unpaired synthetic-image fidelity.",
-            "The AE latent sampler is not learned as part of the AE objective and is intentionally a weak comparator.",
+            ("The Gaussian AE was trained with sampled posterior latent maps and KL regularization, then generates from standard-normal latent maps; inspect image quality and nearest neighbours because a Gaussian prior does not guarantee anatomical plausibility."
+             if args.model == "ae" and args.ae_latent_mode == "gaussian" else
+             "The deterministic AE is reconstruction-only and has no learned sampling prior; its generated diagnostics use local latent interpolation."),
         ],
     }
     save_json(args.run_dir / "run_summary.json", final_summary)
-    print(
-        f"Best validation SSIM: {best_val_ssim:.4f}; held-out test SSIM: {test_metrics['ssim']:.4f}"
-    )
+    print(f"Best validation SSIM: {best_val_ssim:.4f}; held-out test SSIM: {test_metrics['ssim']:.4f}")
     print(f"Run artifacts: {args.run_dir}")
     if not groups_verified:
-        print(
-            "RESULT QUALIFICATION: group mapping is unverified; treat all scores as pipeline smoke-test results only."
-        )
+        print("RESULT QUALIFICATION: group mapping is unverified; treat all scores as pipeline smoke-test results only.")
 
 
 if __name__ == "__main__":

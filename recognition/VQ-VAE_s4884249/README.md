@@ -61,6 +61,27 @@ python3 -m pip install -r requirements.txt
 Some changes were made to the Preliminary models when issues were identified which would prevent
 the task to be completed successfully with the project's scope.
 
+### Version 1
+
+The AE generated samples by encoding training images, finding nearby latent representations,
+interpolating between pairs of those representations, and decoding the interpolations. This
+preserved the spatial structure of real latent maps much better than independent Gaussian
+noise and the sampler was reproducible with a fixed seed.
+
+![Generated samples from nearby latent representations](./images/generated_samples_from_nearby_latent_representations.png)
+_Basic Auto-Encoder: Generated samples from nearby latent representations_
+
+However, a basic deterministic AE is not a probabilistic generative model. Latent interpolation
+should work, but the outputs may resemble training images or contain unrealistic blends. The new
+sample grid and nearest-neighbour results should be inspected before treating them as valid
+synthetic MRI data. To properly compare the model with the VQ-VAE, it was upgraded to a VAE such
+that the latent space was regularised so sampling can produce more meaningful outputs (and new).
+
+> Takeaway
+> To achieve a reasonable baseline, a VAE was used rather than a basic AE such that new samples
+> can be more reliably generated from the latent distribution as required to fulfill ethical
+> and task constraints (i.e. generating truly new samples rather than recreating existing images).
+
 ## Dependencies
 
 - numpy 2.14.1

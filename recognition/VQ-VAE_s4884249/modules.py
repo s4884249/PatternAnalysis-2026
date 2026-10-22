@@ -2,7 +2,6 @@
 
 This file intentionally depends only on PyTorch and the Python standard library.
 """
-
 from __future__ import annotations
 
 from typing import Dict, Tuple
@@ -15,9 +14,7 @@ import torch.nn.functional as F
 class ConvEncoder(nn.Module):
     """Three-stage convolutional encoder; spatial size is reduced by 8x."""
 
-    def __init__(
-        self, in_channels: int = 1, base_channels: int = 32, latent_dim: int = 64
-    ):
+    def __init__(self, in_channels: int = 1, base_channels: int = 32, latent_dim: int = 64):
         super().__init__()
         c1, c2, c3 = base_channels, base_channels * 2, base_channels * 4
         self.network = nn.Sequential(
@@ -40,9 +37,7 @@ class ConvEncoder(nn.Module):
 class ConvDecoder(nn.Module):
     """Decoder paired with ConvEncoder; outputs intensities in [0, 1]."""
 
-    def __init__(
-        self, out_channels: int = 1, base_channels: int = 32, latent_dim: int = 64
-    ):
+    def __init__(self, out_channels: int = 1, base_channels: int = 32, latent_dim: int = 64):
         super().__init__()
         c1, c2, c3 = base_channels, base_channels * 2, base_channels * 4
         self.network = nn.Sequential(
@@ -85,15 +80,70 @@ class BasicAutoencoder(nn.Module):
         return {"reconstruction": reconstruction, "latent": latent}
 
 
+class GaussianAutoencoder(nn.Module):
+    """VAE-style convolutional AE whose decoder is trained on sampled latent maps.
+
+    The encoder predicts a diagonal Gaussian posterior q(z|x) at every latent
+    spatial position. During training, z is sampled with the reparameterization
+    trick and the KL term nudges q(z|x) toward an independent standard-normal
+    prior. Generation can therefore draw z ~ N(0, I) rather than feeding the
+    decoder arbitrary latent noise it never saw during training.
+
+    ``encode`` returns the posterior mean for deterministic diagnostics and
+    latent-feature comparisons. ``forward`` samples during training and uses
+    the mean during evaluation so reconstruction metrics are reproducible.
+    """
+
+    model_type = "ae"
+    latent_mode = "gaussian"
+
+    def __init__(self, base_channels: int = 32, latent_dim: int = 64, kl_beta: float = 0.1):
+        super().__init__()
+        if kl_beta < 0:
+            raise ValueError("kl_beta cannot be negative")
+        # The encoder emits mean and log-variance maps concatenated by channel.
+        self.encoder = ConvEncoder(base_channels=base_channels, latent_dim=2 * latent_dim)
+        self.decoder = ConvDecoder(base_channels=base_channels, latent_dim=latent_dim)
+        self.latent_dim = int(latent_dim)
+        self.kl_beta = float(kl_beta)
+
+    def encode_distribution(self, images: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        parameters = self.encoder(images)
+        mu, logvar = parameters.chunk(2, dim=1)
+        # Prevent exp(logvar) overflow while retaining a broad useful range.
+        return mu, logvar.clamp(min=-10.0, max=8.0)
+
+    def encode(self, images: torch.Tensor) -> torch.Tensor:
+        mu, _ = self.encode_distribution(images)
+        return mu
+
+    def reparameterize(self, mu: torch.Tensor, logvar: torch.Tensor) -> torch.Tensor:
+        std = torch.exp(0.5 * logvar)
+        return mu + torch.randn_like(std) * std
+
+    def decode(self, latent: torch.Tensor) -> torch.Tensor:
+        return self.decoder(latent)
+
+    def forward(self, images: torch.Tensor) -> Dict[str, torch.Tensor]:
+        mu, logvar = self.encode_distribution(images)
+        latent = self.reparameterize(mu, logvar) if self.training else mu
+        reconstruction = self.decode(latent)
+        # Mean KL per latent scalar keeps the loss scale comparable across image
+        # sizes; kl_beta controls the reconstruction/regularization trade-off.
+        kl_loss = 0.5 * (mu.square() + logvar.exp() - 1.0 - logvar).mean()
+        return {
+            "reconstruction": reconstruction,
+            "latent": latent,
+            "mu": mu,
+            "logvar": logvar,
+            "kl_loss": kl_loss,
+        }
+
+
 class VectorQuantizer(nn.Module):
     """Nearest-neighbour vector quantizer with a straight-through estimator."""
 
-    def __init__(
-        self,
-        num_embeddings: int = 256,
-        embedding_dim: int = 64,
-        commitment_beta: float = 0.25,
-    ):
+    def __init__(self, num_embeddings: int = 256, embedding_dim: int = 64, commitment_beta: float = 0.25):
         super().__init__()
         if num_embeddings < 2:
             raise ValueError("num_embeddings must be at least 2")
@@ -103,9 +153,7 @@ class VectorQuantizer(nn.Module):
         self.embedding_dim = int(embedding_dim)
         self.commitment_beta = float(commitment_beta)
         self.embedding = nn.Embedding(self.num_embeddings, self.embedding_dim)
-        nn.init.uniform_(
-            self.embedding.weight, -1.0 / self.num_embeddings, 1.0 / self.num_embeddings
-        )
+        nn.init.uniform_(self.embedding.weight, -1.0 / self.num_embeddings, 1.0 / self.num_embeddings)
 
     def forward(self, z_e: torch.Tensor):
         """Return straight-through latents, codebook loss, commitment loss, IDs, perplexity."""
@@ -123,9 +171,7 @@ class VectorQuantizer(nn.Module):
             - 2.0 * flat @ codebook.t()
         )
         indices = distances.argmin(dim=1)
-        quantized = (
-            self.embedding(indices).view_as(vectors).permute(0, 3, 1, 2).contiguous()
-        )
+        quantized = self.embedding(indices).view_as(vectors).permute(0, 3, 1, 2).contiguous()
 
         codebook_loss = F.mse_loss(quantized, z_e.detach())
         commitment_loss = self.commitment_beta * F.mse_loss(z_e, quantized.detach())
@@ -135,19 +181,10 @@ class VectorQuantizer(nn.Module):
         counts = torch.bincount(indices, minlength=self.num_embeddings).to(z_e.dtype)
         probabilities = counts / counts.sum().clamp_min(1.0)
         nonzero = probabilities > 0
-        perplexity = torch.exp(
-            -(probabilities[nonzero] * probabilities[nonzero].log()).sum()
-        )
+        perplexity = torch.exp(-(probabilities[nonzero] * probabilities[nonzero].log()).sum())
         ids = indices.view(z_e.shape[0], z_e.shape[2], z_e.shape[3])
         active_codes = nonzero.sum().to(z_e.dtype)
-        return (
-            quantized_st,
-            codebook_loss,
-            commitment_loss,
-            ids,
-            perplexity,
-            active_codes,
-        )
+        return quantized_st, codebook_loss, commitment_loss, ids, perplexity, active_codes
 
 
 class VQVAE(nn.Module):
@@ -195,9 +232,7 @@ class VQVAE(nn.Module):
 
     def forward(self, images: torch.Tensor) -> Dict[str, torch.Tensor]:
         z_e = self.encode(images)
-        z_q_st, codebook_loss, commitment_loss, indices, perplexity, active_codes = (
-            self.quantizer(z_e)
-        )
+        z_q_st, codebook_loss, commitment_loss, indices, perplexity, active_codes = self.quantizer(z_e)
         reconstruction = self.decode(z_q_st)
         return {
             "reconstruction": reconstruction,
@@ -257,12 +292,7 @@ class CodePrior(nn.Module):
             "A", hidden_channels, hidden_channels, kernel_size=7, padding=3
         )
         self.hidden_convs = nn.ModuleList(
-            [
-                MaskedConv2d(
-                    "B", hidden_channels, hidden_channels, kernel_size=3, padding=1
-                )
-                for _ in range(4)
-            ]
+            [MaskedConv2d("B", hidden_channels, hidden_channels, kernel_size=3, padding=1) for _ in range(4)]
         )
         self.output = nn.Sequential(
             nn.ReLU(inplace=True),
@@ -293,16 +323,12 @@ class CodePrior(nn.Module):
         """Sequentially sample [N,H,W] code-index grids from the learned prior."""
         if temperature <= 0:
             raise ValueError("temperature must be greater than zero")
-        tokens = torch.zeros(
-            (num_samples, height, width), dtype=torch.long, device=device
-        )
+        tokens = torch.zeros((num_samples, height, width), dtype=torch.long, device=device)
         for row in range(height):
             for col in range(width):
                 logits = self(tokens)[:, :, row, col] / temperature
                 probs = torch.softmax(logits, dim=-1)
-                sampled = torch.multinomial(
-                    probs, num_samples=1, generator=generator
-                ).squeeze(-1)
+                sampled = torch.multinomial(probs, num_samples=1, generator=generator).squeeze(-1)
                 tokens[:, row, col] = sampled
         return tokens
 
@@ -314,6 +340,13 @@ def build_model(model_type: str, config: Dict) -> nn.Module:
         "latent_dim": int(config.get("latent_dim", 64)),
     }
     if model_type == "ae":
+        # Checkpoints made before Gaussian AE support omit this field and remain
+        # loadable as deterministic AEs. New training defaults to Gaussian mode.
+        if config.get("ae_latent_mode", "deterministic") == "gaussian":
+            return GaussianAutoencoder(
+                **shared,
+                kl_beta=float(config.get("ae_kl_beta", 0.1)),
+            )
         return BasicAutoencoder(**shared)
     if model_type == "vqvae":
         return VQVAE(
@@ -326,6 +359,4 @@ def build_model(model_type: str, config: Dict) -> nn.Module:
 
 def count_parameters(model: nn.Module) -> int:
     """Return the number of trainable parameters."""
-    return sum(
-        parameter.numel() for parameter in model.parameters() if parameter.requires_grad
-    )
+    return sum(parameter.numel() for parameter in model.parameters() if parameter.requires_grad)
