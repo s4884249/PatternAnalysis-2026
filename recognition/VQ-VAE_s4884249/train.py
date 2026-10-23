@@ -1,519 +1,371 @@
-"""Train/evaluate either the AE reconstruction baseline or the VQ-VAE.
+"""Train and evaluate the VAE or the VQ-VAE on 2D HipMRI slices.
 
-Examples are in README.md. The test split is evaluated once, after checkpoint
-selection using validation SSIM. VQ-VAE synthetic sampling additionally trains
-a small autoregressive prior on training-split code maps only.
+The best epoch is chosen on validation SSIM and the test split is evaluated once,
+with that checkpoint. The VQ-VAE then fits a PixelCNN-style prior on training-split
+code maps so it can generate new images. All settings live in params.py; the run
+directory is derived from them (see params.run_dir_name).
+
+Progress images (at most 10 columns, evenly spaced epochs):
+    reconstructions_by_epoch.png  fixed validation image: input + reconstruction per snapshot
+    prior_samples_by_epoch.png    VQ-VAE only: one prior sample per snapshot
 """
+
 from __future__ import annotations
 
 import argparse
-import csv
-import json
 import math
-import random
 import time
+from collections import defaultdict
+from dataclasses import asdict
 from pathlib import Path
-from typing import Dict, Iterable, List, Sequence, Tuple
+from typing import Dict, List, Tuple
 
 import numpy as np
 import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, TensorDataset
 
-from dataset import NiftiSliceDataset, all_groups_verified, load_manifest, split_by_group, split_from_manifest
+from dataset import NiftiSliceDataset, load_manifest, split_from_manifest
 from modules import CodePrior, VQVAE, build_model, count_parameters
+from params import MANIFEST, MODELS, RUNS_DIR, TrainParams, add_overrides, apply_overrides, run_dir_name
+from utils import get_device, save_image_grid, save_json, set_seed, ssim_2d, to_device, write_csv
+
+SSIM_TARGET = 0.6  # assignment target, drawn on the SSIM curve
+MAX_SNAPSHOTS = 10  # upper bound on columns in the progress images
 
 
-def set_seed(seed: int) -> None:
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
-    # Determinism is prioritized for reproducibility over maximum throughput.
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
+def snapshot_epochs(total: int) -> set:
+    """Evenly spaced epochs for progress images: every ceil(total/10), plus the last.
+
+    100 epochs -> 10, 20, ..., 100; 5 epochs -> 1..5; 15 epochs -> 2, 4, ..., 14, 15.
+    The count never exceeds MAX_SNAPSHOTS.
+    """
+    step = math.ceil(total / MAX_SNAPSHOTS)
+    return set(range(step, total + 1, step)) | {total}
 
 
-def get_device(requested: str) -> torch.device:
-    if requested == "auto":
-        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    device = torch.device(requested)
-    if device.type == "cuda" and not torch.cuda.is_available():
-        raise RuntimeError("CUDA was requested but torch.cuda.is_available() is false")
-    return device
+def compute_loss(model, images: torch.Tensor, model_type: str) -> Tuple[torch.Tensor, Dict[str, float], dict]:
+    """Return the total loss, a dict of float metrics and the raw model output.
 
-
-def load_batch(batch: Dict[str, object], device: torch.device) -> torch.Tensor:
-    return batch["image"].to(device=device, dtype=torch.float32, non_blocking=(device.type == "cuda"))
-
-
-def compute_loss(model, images: torch.Tensor, model_type: str) -> Tuple[torch.Tensor, Dict[str, float], Dict[str, torch.Tensor]]:
+    VAE:    MSE + kl_beta * KL
+    VQ-VAE: MSE + codebook loss + commitment loss (the weight is applied in the quantiser)
+    MSE on [0, 1] intensities is the reconstruction term for both, so scores are comparable.
+    """
     output = model(images)
-    reconstruction_loss = F.mse_loss(output["reconstruction"], images)
-    if model_type == "ae":
-        kl_loss = output.get("kl_loss", torch.zeros((), device=images.device))
-        kl_beta = float(getattr(model, "kl_beta", 0.0))
-        weighted_kl_loss = kl_beta * kl_loss
-        total_loss = reconstruction_loss + weighted_kl_loss
-        codebook_loss = torch.zeros((), device=images.device)
-        commitment_loss = torch.zeros((), device=images.device)
+    mse = F.mse_loss(output["reconstruction"], images)
+    if model_type == "vae":
+        loss = mse + model.kl_beta * output["kl_loss"]
+        extra = {"kl_loss": output["kl_loss"]}
     else:
-        kl_loss = torch.zeros((), device=images.device)
-        weighted_kl_loss = torch.zeros((), device=images.device)
-        codebook_loss = output["codebook_loss"]
-        commitment_loss = output["commitment_loss"]
-        total_loss = reconstruction_loss + codebook_loss + commitment_loss
-    stats = {
-        "loss": float(total_loss.detach().item()),
-        "reconstruction_mse": float(reconstruction_loss.detach().item()),
-        "codebook_loss": float(codebook_loss.detach().item()),
-        "commitment_loss": float(commitment_loss.detach().item()),
-        "kl_loss": float(kl_loss.detach().item()),
-        "weighted_kl_loss": float(weighted_kl_loss.detach().item()),
-        "perplexity": float(output["perplexity"].detach().item()) if model_type == "vqvae" else float("nan"),
-        "active_codes": float(output["active_codes"].detach().item()) if model_type == "vqvae" else float("nan"),
-    }
-    return total_loss, stats, output
+        loss = mse + output["codebook_loss"] + output["commitment_loss"]
+        extra = {k: output[k] for k in ("codebook_loss", "commitment_loss", "perplexity", "active_codes")}
+    metrics = {"loss": loss, "reconstruction_mse": mse, **extra}
+    return loss, {name: float(value.detach()) for name, value in metrics.items()}, output
 
 
-def per_image_ssim(reconstructions: torch.Tensor, images: torch.Tensor) -> List[float]:
-    from skimage.metrics import structural_similarity
-
-    recon = reconstructions.detach().float().clamp(0, 1).cpu().numpy()[:, 0]
-    real = images.detach().float().clamp(0, 1).cpu().numpy()[:, 0]
-    return [
-        float(structural_similarity(real[i], recon[i], data_range=1.0, gaussian_weights=True, use_sample_covariance=False))
-        for i in range(len(real))
-    ]
-
-
-def evaluate_model(
+def run_epoch(
     model,
     loader: DataLoader,
     model_type: str,
     device: torch.device,
-    max_batches: int = 0,
+    optimizer: torch.optim.Optimizer | None = None,
+    limit_batches: int = 0,
+    with_ssim: bool = False,
 ) -> Dict[str, float]:
-    model.eval()
-    sums: Dict[str, float] = {
-        "loss": 0.0, "reconstruction_mse": 0.0, "codebook_loss": 0.0,
-        "commitment_loss": 0.0, "kl_loss": 0.0, "weighted_kl_loss": 0.0,
-        "ssim": 0.0, "perplexity": 0.0, "active_codes": 0.0,
-    }
+    """One pass over `loader`: trains if an optimizer is given, otherwise evaluates.
+
+    Metrics are averaged per image (not per batch) so a short last batch is not
+    over-weighted. SSIM is only computed on request because it runs on the CPU.
+    """
+    training = optimizer is not None
+    model.train(training)
+    sums: Dict[str, float] = defaultdict(float)
     n_images = 0
-    with torch.inference_mode():
-        for batch_index, batch in enumerate(loader):
-            if max_batches and batch_index >= max_batches:
+    with torch.inference_mode(not training):
+        for index, batch in enumerate(loader):
+            if limit_batches and index >= limit_batches:
                 break
-            images = load_batch(batch, device)
-            _, stats, output = compute_loss(model, images, model_type)
-            ssims = per_image_ssim(output["reconstruction"], images)
-            batch_size = int(images.shape[0])
-            n_images += batch_size
-            for key in ("loss", "reconstruction_mse", "codebook_loss", "commitment_loss", "kl_loss", "weighted_kl_loss"):
-                sums[key] += stats[key] * batch_size
-            sums["ssim"] += float(np.sum(ssims))
-            if model_type == "vqvae":
-                sums["perplexity"] += stats["perplexity"] * batch_size
-                sums["active_codes"] += stats["active_codes"] * batch_size
+            images = to_device(batch, device)
+            loss, metrics, output = compute_loss(model, images, model_type)
+            if training:
+                if not torch.isfinite(loss):
+                    raise FloatingPointError(f"Non-finite loss at batch {index}: {loss.item()}")
+                optimizer.zero_grad(set_to_none=True)
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)  # guards against rare gradient spikes
+                optimizer.step()
+            if with_ssim:
+                real = images.clamp(0, 1)[:, 0].cpu().numpy()
+                recon = output["reconstruction"].clamp(0, 1)[:, 0].cpu().numpy()
+                metrics["ssim"] = float(np.mean([ssim_2d(a, b) for a, b in zip(real, recon)]))
+            count = int(images.shape[0])
+            n_images += count
+            for name, value in metrics.items():
+                sums[name] += value * count
     if n_images == 0:
-        raise RuntimeError("Evaluation loader produced no images; check split and limit settings.")
-    result = {key: value / n_images for key, value in sums.items()}
-    result["n_images"] = int(n_images)
-    return result
+        raise RuntimeError("Loader produced no images; check the manifest, split and limit_batches.")
+    return {name: value / n_images for name, value in sums.items()} | {"n_images": n_images}
 
 
-def train_one_epoch(
-    model,
-    loader: DataLoader,
-    optimizer: torch.optim.Optimizer,
-    model_type: str,
-    device: torch.device,
-    max_batches: int = 0,
-) -> Dict[str, float]:
-    model.train()
-    keys = ["loss", "reconstruction_mse", "codebook_loss", "commitment_loss", "kl_loss", "weighted_kl_loss", "perplexity", "active_codes"]
-    sums = {key: 0.0 for key in keys}
-    n_images = 0
-    for batch_index, batch in enumerate(loader):
-        if max_batches and batch_index >= max_batches:
-            break
-        images = load_batch(batch, device)
-        optimizer.zero_grad(set_to_none=True)
-        loss, stats, _ = compute_loss(model, images, model_type)
-        if not torch.isfinite(loss):
-            raise FloatingPointError(f"Non-finite loss at batch {batch_index}: {loss.item()}")
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
-        optimizer.step()
-        n = int(images.shape[0])
-        n_images += n
-        for key in keys:
-            value = stats[key]
-            if math.isfinite(value):
-                sums[key] += value * n
-    if n_images == 0:
-        raise RuntimeError("Training loader produced no images; check the manifest and split.")
-    return {key: sums[key] / n_images for key in keys} | {"n_images": n_images}
+@torch.inference_mode()
+def reconstruct_one(model, image: torch.Tensor, device: torch.device) -> torch.Tensor:
+    """Reconstruct a single [1, H, W] image (eval mode, so the VAE uses its mean latent)."""
+    model.eval()
+    return model(image[None].to(device))["reconstruction"].clamp(0, 1)[0].cpu()
 
 
-def save_json(path: Path, obj: object) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", encoding="utf-8") as handle:
-        json.dump(obj, handle, indent=2, allow_nan=False)
-        handle.write("\n")
-
-
-def write_history_csv(path: Path, rows: Sequence[Dict[str, object]]) -> None:
-    if not rows:
-        return
-    keys = list(dict.fromkeys(key for row in rows for key in row.keys()))
-    with path.open("w", newline="", encoding="utf-8") as handle:
-        writer = csv.DictWriter(handle, fieldnames=keys)
-        writer.writeheader()
-        writer.writerows(rows)
-
-
-def plot_history(run_dir: Path, history: Sequence[Dict[str, object]]) -> None:
+def plot_history(run_dir: Path, history: List[dict]) -> None:
     import matplotlib
+
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
-    epochs = [int(row["epoch"]) for row in history]
-    fig, axes = plt.subplots(1, 2, figsize=(11, 4))
-    axes[0].plot(epochs, [float(row["train_loss"]) for row in history], label="train total loss")
-    axes[0].plot(epochs, [float(row["val_loss"]) for row in history], label="validation total loss")
-    axes[0].set_xlabel("Epoch")
-    axes[0].set_ylabel("Loss")
-    axes[0].legend()
-    axes[0].grid(alpha=0.2)
-    axes[1].plot(epochs, [float(row["val_ssim"]) for row in history], label="validation SSIM")
-    axes[1].axhline(0.6, linestyle="--", label="assignment target 0.6")
-    axes[1].set_xlabel("Epoch")
-    axes[1].set_ylabel("SSIM")
-    axes[1].legend()
-    axes[1].grid(alpha=0.2)
+    epochs = [row["epoch"] for row in history]
+    fig, (loss_ax, ssim_ax) = plt.subplots(1, 2, figsize=(11, 4))
+    loss_ax.plot(epochs, [row["train_loss"] for row in history], label="train total loss")
+    loss_ax.plot(epochs, [row["val_loss"] for row in history], label="validation total loss")
+    loss_ax.set(xlabel="Epoch", ylabel="Loss")
+    ssim_ax.plot(epochs, [row["val_ssim"] for row in history], label="validation SSIM")
+    ssim_ax.axhline(SSIM_TARGET, linestyle="--", color="gray", label=f"assignment target {SSIM_TARGET}")
+    ssim_ax.set(xlabel="Epoch", ylabel="SSIM")
+    for ax in (loss_ax, ssim_ax):
+        ax.legend()
+        ax.grid(alpha=0.2)
     fig.tight_layout()
     fig.savefig(run_dir / "training_curves.png", dpi=160)
     plt.close(fig)
 
 
-def make_loaders(
-    splits: Dict[str, List[Dict[str, str]]], data_root: Path, image_height: int, image_width: int,
-    batch_size: int, workers: int, seed: int,
-) -> Dict[str, DataLoader]:
-    generator = torch.Generator().manual_seed(seed)
-    loaders = {}
-    for name, rows in splits.items():
-        dataset = NiftiSliceDataset(rows, data_root, image_height=image_height, image_width=image_width)
-        loaders[name] = DataLoader(
-            dataset,
-            batch_size=batch_size,
+def make_loaders(splits: Dict[str, List[dict]], data_root: Path, p: TrainParams) -> Dict[str, DataLoader]:
+    generator = torch.Generator().manual_seed(p.seed)  # reproducible training shuffle order
+    return {
+        name: DataLoader(
+            NiftiSliceDataset(rows, data_root, p.image_height, p.image_width),
+            batch_size=p.batch_size,
             shuffle=(name == "train"),
-            num_workers=workers,
+            num_workers=p.workers,
             pin_memory=torch.cuda.is_available(),
-            persistent_workers=(workers > 0),
+            persistent_workers=p.workers > 0,
             generator=generator if name == "train" else None,
-            drop_last=False,
         )
-    return loaders
-
-
-def save_checkpoint(path: Path, model, args, epoch: int, val_metrics: Dict[str, float], parameter_count: int) -> None:
-    config = {
-        "base_channels": args.base_channels,
-        "latent_dim": args.latent_dim,
-        "codebook_size": args.codebook_size,
-        "commitment_beta": args.commitment_beta,
-        "ae_latent_mode": args.ae_latent_mode,
-        "ae_kl_beta": args.ae_kl_beta,
-        "image_height": args.image_height,
-        "image_width": args.image_width,
-        "data_root": str(args.data_root.resolve()),
-        "manifest": str(args.manifest.resolve()),
-        "seed": args.seed,
+        for name, rows in splits.items()
     }
-    torch.save({
-        "model_type": args.model,
-        "model_config": config,
-        "model_state_dict": model.state_dict(),
-        "epoch": int(epoch),
-        "validation_metrics": val_metrics,
-        "parameter_count": int(parameter_count),
-    }, path)
 
 
 @torch.inference_mode()
-def collect_code_maps(model: VQVAE, loader: DataLoader, device: torch.device, max_batches: int = 0) -> torch.Tensor:
+def collect_code_maps(model: VQVAE, loader: DataLoader, device: torch.device, limit_batches: int = 0) -> torch.Tensor:
+    """Encode training images into [N, H, W] code-index maps, the prior's training data."""
     model.eval()
     maps = []
-    for batch_index, batch in enumerate(loader):
-        if max_batches and batch_index >= max_batches:
+    for index, batch in enumerate(loader):
+        if limit_batches and index >= limit_batches:
             break
-        images = load_batch(batch, device)
-        maps.append(model.encode_indices(images).cpu())
-    if not maps:
-        raise RuntimeError("No code maps produced for PixelCNN prior training")
+        maps.append(model.encode_indices(to_device(batch, device)).cpu())
     return torch.cat(maps, dim=0)
 
 
-def train_code_prior(
-    model: VQVAE,
-    train_loader: DataLoader,
-    args,
-    device: torch.device,
-    run_dir: Path,
-) -> Dict[str, object]:
-    code_maps = collect_code_maps(model, train_loader, device, args.limit_train_batches)
-    dataset = TensorDataset(code_maps)
-    loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, num_workers=0)
-    prior = CodePrior(codebook_size=args.codebook_size, hidden_channels=args.prior_hidden).to(device)
-    optimizer = torch.optim.Adam(prior.parameters(), lr=args.prior_lr)
-    prior_history = []
+def train_code_prior(model: VQVAE, train_loader: DataLoader, p: TrainParams, device: torch.device, run_dir: Path) -> dict:
+    """Fit the autoregressive prior on training-split code maps only (no test leakage)."""
+    code_maps = collect_code_maps(model, train_loader, device, p.limit_batches)
+    height, width = code_maps.shape[1:]
+    loader = DataLoader(TensorDataset(code_maps), batch_size=p.batch_size, shuffle=True)
+    prior = CodePrior(codebook_size=p.codebook_size, hidden_channels=p.prior_hidden).to(device)
+    optimizer = torch.optim.Adam(prior.parameters(), lr=p.prior_lr)
+
+    snapshots = snapshot_epochs(p.prior_epochs)
+    frames, titles = [], []
+    history = []
     start = time.perf_counter()
-    for epoch in range(1, args.prior_epochs + 1):
+    for epoch in range(1, p.prior_epochs + 1):
         prior.train()
-        total_loss = 0.0
-        count = 0
+        total, count = 0.0, 0
         for (indices,) in loader:
             indices = indices.to(device=device, dtype=torch.long)
-            optimizer.zero_grad(set_to_none=True)
+            # Next-code prediction: cross-entropy of every position given earlier positions.
             logits = prior(indices)
-            loss = F.cross_entropy(logits.permute(0, 2, 3, 1).reshape(-1, args.codebook_size), indices.reshape(-1))
+            loss = F.cross_entropy(logits.permute(0, 2, 3, 1).reshape(-1, p.codebook_size), indices.reshape(-1))
             if not torch.isfinite(loss):
                 raise FloatingPointError(f"Non-finite code-prior loss at epoch {epoch}")
+            optimizer.zero_grad(set_to_none=True)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(prior.parameters(), max_norm=5.0)
             optimizer.step()
-            n = int(indices.shape[0])
-            total_loss += float(loss.detach().item()) * n
-            count += n
-        epoch_loss = total_loss / max(1, count)
-        prior_history.append({"epoch": epoch, "train_cross_entropy": epoch_loss})
-        print(f"[prior] epoch {epoch:03d}/{args.prior_epochs:03d} | train CE={epoch_loss:.5f}")
+            total += float(loss.detach()) * indices.shape[0]
+            count += indices.shape[0]
+        history.append({"epoch": epoch, "train_cross_entropy": total / count})
+        print(f"[prior] epoch {epoch:03d}/{p.prior_epochs:03d} | train CE={total / count:.5f}")
+
+        if epoch in snapshots:
+            # Same generator seed every time, so columns differ only because the prior improved.
+            prior.eval()
+            generator = torch.Generator(device=device).manual_seed(p.seed)
+            with torch.inference_mode():
+                codes = prior.sample(1, height, width, device, generator=generator)
+                sample = model.decode_indices(codes).clamp(0, 1)[0].cpu()
+            frames.append(sample)
+            titles.append(f"Prior epoch {epoch}")
+            save_image_grid(torch.stack(frames), run_dir / "prior_samples_by_epoch.png", titles, ncols=len(frames))
     elapsed = time.perf_counter() - start
-    torch.save({
-        "state_dict": prior.state_dict(),
-        "codebook_size": args.codebook_size,
-        "hidden_channels": args.prior_hidden,
-        "latent_height": int(code_maps.shape[1]),
-        "latent_width": int(code_maps.shape[2]),
-        "train_examples": int(code_maps.shape[0]),
-        "history": prior_history,
-    }, run_dir / "prior.pt")
-    write_history_csv(run_dir / "prior_history.csv", prior_history)
+
+    torch.save(
+        {
+            "state_dict": prior.state_dict(),
+            "codebook_size": p.codebook_size,
+            "hidden_channels": p.prior_hidden,
+            "latent_height": int(height),
+            "latent_width": int(width),
+            "history": history,
+        },
+        run_dir / "prior.pt",
+    )
+    write_csv(run_dir / "prior_history.csv", history)
     return {
+        "prior": "PixelCNN-like autoregressive prior trained on training-split code maps",
         "train_code_maps": int(code_maps.shape[0]),
-        "latent_shape": list(code_maps.shape[1:]),
+        "latent_shape": [int(height), int(width)],
         "prior_parameters": count_parameters(prior),
         "prior_training_seconds": elapsed,
-        "final_train_cross_entropy": prior_history[-1]["train_cross_entropy"] if prior_history else None,
+        "final_train_cross_entropy": history[-1]["train_cross_entropy"],
     }
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser(description="Train a basic AE baseline or a VQ-VAE on 2D HipMRI NIfTI slices")
-    parser.add_argument("--model", choices=("ae", "vqvae"), required=True)
-    parser.add_argument("--data-root", type=Path, default=Path("/home/groups/comp3710/HipMRI_Study_open/keras_slices_data"))
-    parser.add_argument("--manifest", type=Path, required=True, help="CSV created by dataset.py audit")
-    parser.add_argument("--split-mode", choices=("predefined", "grouped"), default="predefined",
-                        help="Use the existing keras_slices_{train,validate,test} folders (default), or create a new group split")
-    parser.add_argument("--run-dir", type=Path, required=True)
-    parser.add_argument("--device", default="auto", help="auto, cpu, cuda, or cuda:0")
-    parser.add_argument("--epochs", type=int, default=50)
-    parser.add_argument("--batch-size", type=int, default=64)
-    parser.add_argument("--workers", type=int, default=4)
-    parser.add_argument("--lr", type=float, default=2e-4)
-    parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--image-height", type=int, default=128)
-    parser.add_argument("--image-width", type=int, default=80)
-    parser.add_argument("--base-channels", type=int, default=32)
-    parser.add_argument("--latent-dim", type=int, default=64)
-    parser.add_argument("--codebook-size", type=int, default=256)
-    parser.add_argument("--commitment-beta", type=float, default=0.25)
-    parser.add_argument("--ae-latent-mode", choices=("gaussian", "deterministic"), default="gaussian",
-                        help="AE only: gaussian learns to decode random N(0,1) latent maps; deterministic is reconstruction-only")
-    parser.add_argument("--ae-kl-beta", type=float, default=0.1,
-                        help="AE only: KL regularization strength for the Gaussian latent mode")
-    parser.add_argument("--prior-epochs", type=int, default=15)
-    parser.add_argument("--prior-hidden", type=int, default=64)
-    parser.add_argument("--prior-lr", type=float, default=2e-4)
-    parser.add_argument("--include-unknown", action="store_true", help="Include kind=unknown after manually auditing the manifest")
-    parser.add_argument("--allow-unverified-groups", action="store_true", help="Unsafe override; use only for pipeline smoke tests")
-    parser.add_argument("--limit-train-batches", type=int, default=0, help="Debug only: cap train batches/epoch; 0 means all")
-    parser.add_argument("--limit-val-batches", type=int, default=0, help="Debug only: cap validation batches; 0 means all")
-    parser.add_argument("--limit-test-batches", type=int, default=0, help="Debug only: cap test batches; 0 means all")
-    args = parser.parse_args()
+def train_model(
+    model_type: str, p: TrainParams, data_root: Path, manifest: Path, run_dir: Path, train_prior: bool = True
+) -> dict:
+    """Train one model end to end and write all artifacts into run_dir; returns the summary dict.
 
-    if args.epochs < 1 or args.batch_size < 1 or args.workers < 0:
-        parser.error("epochs/batch-size must be positive and workers non-negative")
-    if args.ae_kl_beta < 0:
-        parser.error("ae-kl-beta cannot be negative")
-    if args.model == "vqvae" and args.prior_epochs < 1:
-        parser.error("VQ-VAE sampling requires --prior-epochs >= 1 to train the code-index prior")
-    args.data_root = args.data_root.expanduser().resolve()
-    args.manifest = args.manifest.expanduser().resolve()
-    args.run_dir = args.run_dir.expanduser().resolve()
-    args.run_dir.mkdir(parents=True, exist_ok=True)
-    set_seed(args.seed)
-    device = get_device(args.device)
-    print(f"Device: {device}")
-    if device.type == "cuda":
-        print(f"GPU: {torch.cuda.get_device_name(device)}")
+    train_prior=False skips the VQ-VAE prior (used by experiments.py, which only
+    compares reconstruction quality and so does not need to generate images).
+    """
+    data_root, manifest, run_dir = data_root.expanduser().resolve(), manifest.expanduser().resolve(), run_dir.resolve()
+    run_dir.mkdir(parents=True, exist_ok=True)
+    set_seed(p.seed)
+    device = get_device(p.device)
+    print(f"Device: {device}" + (f" ({torch.cuda.get_device_name(device)})" if device.type == "cuda" else ""))
 
-    rows = load_manifest(args.manifest, args.data_root, include_unknown=args.include_unknown)
-    groups_verified = all_groups_verified(rows)
-    if args.split_mode == "grouped":
-        if not groups_verified and not args.allow_unverified_groups:
-            raise SystemExit(
-                "Refusing to create a new split because group_id_verified is not true for every selected image. "
-                "For the supplied HipMRI layout, prefer the default --split-mode predefined; it uses the "
-                "existing train/validate/test folders. For a custom grouped split, verify group IDs first."
-            )
-        if not groups_verified:
-            print("WARNING: USING UNVERIFIED GROUP IDs for a newly generated split.")
-        splits = split_by_group(rows, seed=args.seed)
-        split_source = "new_group_split"
-    else:
-        splits = split_from_manifest(rows)
-        split_source = "predefined_directory_split"
-        print("Split source: existing keras_slices_train / keras_slices_validate / keras_slices_test folders")
-        print("Segmentation masks in keras_slices_seg_* folders are excluded from the MRI experiment.")
-
-    split_json = {
-        "seed": args.seed,
-        "split_mode": args.split_mode,
-        "split_source": split_source,
-        "data_root": str(args.data_root),
-        "manifest": str(args.manifest),
-        "group_id_verified": groups_verified,
-        "case_ids_disjoint_across_splits": True,
-        "split_group_counts": {k: len({row["group_id"] for row in values}) for k, values in splits.items()},
-        "split_image_counts": {k: len(values) for k, values in splits.items()},
-        "splits": {k: values for k, values in splits.items()},
-    }
-    save_json(args.run_dir / "split.json", split_json)
-    loaders = make_loaders(
-        splits, args.data_root, args.image_height, args.image_width, args.batch_size, args.workers, args.seed
+    # Use the dataset's own train/val/test folders; masks and unreadable files are excluded.
+    splits = split_from_manifest(load_manifest(manifest, data_root))
+    image_counts = {name: len(rows) for name, rows in splits.items()}
+    save_json(
+        run_dir / "split.json",
+        {
+            "seed": p.seed,
+            "data_root": str(data_root),
+            "manifest": str(manifest),
+            "split_group_counts": {name: len({r["group_id"] for r in rows}) for name, rows in splits.items()},
+            "split_image_counts": image_counts,
+            "splits": splits,  # compare.py checks these lists match across models
+        },
     )
-    if any(len(loaders[name].dataset) == 0 for name in ("train", "val", "test")):
-        raise RuntimeError(f"At least one split is empty: {split_json['split_image_counts']}")
+    loaders = make_loaders(splits, data_root, p)
+    # Fixed validation image for the progress strip (test data is never shown during training).
+    val_set = loaders["val"].dataset
+    fixed_image = val_set[len(val_set) // 2]["image"]
 
-    model_config = {
-        "base_channels": args.base_channels,
-        "latent_dim": args.latent_dim,
-        "codebook_size": args.codebook_size,
-        "commitment_beta": args.commitment_beta,
-        "ae_latent_mode": args.ae_latent_mode if args.model == "ae" else "deterministic",
-        "ae_kl_beta": args.ae_kl_beta,
-    }
-    model = build_model(args.model, model_config).to(device)
+    config = asdict(p) | {"data_root": str(data_root), "manifest": str(manifest)}
+    model = build_model(model_type, config).to(device)
     n_parameters = count_parameters(model)
     print(f"Model parameters: {n_parameters:,}")
     if device.type == "cuda":
         torch.cuda.reset_peak_memory_stats(device)
 
-    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
-    best_val_ssim = -float("inf")
-    history: List[Dict[str, object]] = []
-    train_start = time.perf_counter()
-    for epoch in range(1, args.epochs + 1):
+    optimizer = torch.optim.Adam(model.parameters(), lr=p.lr)
+    snapshots = snapshot_epochs(p.epochs)
+    frames, titles = [fixed_image], ["Input"]
+    best_ssim, best_epoch, history = -float("inf"), 0, []
+    start = time.perf_counter()
+    for epoch in range(1, p.epochs + 1):
         epoch_start = time.perf_counter()
-        train_metrics = train_one_epoch(
-            model, loaders["train"], optimizer, args.model, device, args.limit_train_batches
+        train_m = run_epoch(model, loaders["train"], model_type, device, optimizer, p.limit_batches)
+        val_m = run_epoch(model, loaders["val"], model_type, device, None, p.limit_batches, with_ssim=True)
+        seconds = time.perf_counter() - epoch_start
+        history.append(
+            {"epoch": epoch}
+            | {f"train_{k}": v for k, v in train_m.items() if k != "n_images"}
+            | {f"val_{k}": v for k, v in val_m.items() if k != "n_images"}
+            | {"epoch_seconds": seconds}
         )
-        val_metrics = evaluate_model(model, loaders["val"], args.model, device, args.limit_val_batches)
-        epoch_seconds = time.perf_counter() - epoch_start
-        row: Dict[str, object] = {
-            "epoch": epoch,
-            "train_loss": train_metrics["loss"],
-            "train_reconstruction_mse": train_metrics["reconstruction_mse"],
-            "train_kl_loss": train_metrics["kl_loss"],
-            "train_weighted_kl_loss": train_metrics["weighted_kl_loss"],
-            "train_codebook_loss": train_metrics["codebook_loss"],
-            "train_commitment_loss": train_metrics["commitment_loss"],
-            "train_perplexity": train_metrics["perplexity"],
-            "train_active_codes": train_metrics["active_codes"],
-            "val_loss": val_metrics["loss"],
-            "val_reconstruction_mse": val_metrics["reconstruction_mse"],
-            "val_kl_loss": val_metrics["kl_loss"],
-            "val_weighted_kl_loss": val_metrics["weighted_kl_loss"],
-            "val_ssim": val_metrics["ssim"],
-            "val_perplexity": val_metrics["perplexity"],
-            "val_active_codes": val_metrics["active_codes"],
-            "epoch_seconds": epoch_seconds,
-        }
-        history.append(row)
+        write_csv(run_dir / "history.csv", history)
         print(
-            f"epoch {epoch:03d}/{args.epochs:03d} | train loss={train_metrics['loss']:.5f} "
-            f"val loss={val_metrics['loss']:.5f} val SSIM={val_metrics['ssim']:.4f} "
-            f"| {epoch_seconds:.1f}s"
+            f"epoch {epoch:03d}/{p.epochs:03d} | train loss={train_m['loss']:.5f} "
+            f"val loss={val_m['loss']:.5f} val SSIM={val_m['ssim']:.4f} | {seconds:.1f}s"
         )
-        write_history_csv(args.run_dir / "history.csv", history)
-        if val_metrics["ssim"] > best_val_ssim:
-            best_val_ssim = val_metrics["ssim"]
-            save_checkpoint(args.run_dir / "best.pt", model, args, epoch, val_metrics, n_parameters)
-            save_json(args.run_dir / "best_validation_metrics.json", val_metrics)
 
-    training_seconds = time.perf_counter() - train_start
-    plot_history(args.run_dir, history)
-    checkpoint = torch.load(args.run_dir / "best.pt", map_location=device, weights_only=True)
+        if val_m["ssim"] > best_ssim:  # checkpoint selection uses validation SSIM only
+            best_ssim, best_epoch = val_m["ssim"], epoch
+            torch.save(
+                {
+                    "model_type": model_type,
+                    "model_config": config,
+                    "model_state_dict": model.state_dict(),
+                    "epoch": epoch,
+                    "validation_metrics": val_m,
+                },
+                run_dir / "best.pt",
+            )
+            save_json(run_dir / "best_validation_metrics.json", val_m)
+
+        if epoch in snapshots:
+            recon = reconstruct_one(model, fixed_image, device)
+            ssim = ssim_2d(fixed_image[0].numpy(), recon[0].numpy())
+            frames.append(recon)
+            titles.append(f"Epoch {epoch}\nSSIM {ssim:.3f}")
+            # Rewritten at every snapshot so an interrupted run still has a usable image.
+            save_image_grid(torch.stack(frames), run_dir / "reconstructions_by_epoch.png", titles, ncols=len(frames))
+    training_seconds = time.perf_counter() - start
+    plot_history(run_dir, history)
+
+    # Final, one-off test evaluation with the best validation checkpoint.
+    checkpoint = torch.load(run_dir / "best.pt", map_location=device, weights_only=True)
     model.load_state_dict(checkpoint["model_state_dict"])
-    test_metrics = evaluate_model(model, loaders["test"], args.model, device, args.limit_test_batches)
-    save_json(args.run_dir / "test_metrics.json", test_metrics)
+    test_m = run_epoch(model, loaders["test"], model_type, device, None, p.limit_batches, with_ssim=True)
+    save_json(run_dir / "test_metrics.json", test_m)
 
-    # Gaussian AE learns a prior-matched latent distribution; deterministic AE remains
-    # available as a reconstruction-only ablation. VQ-VAE uses a learned discrete prior.
-    extra: Dict[str, object] = {}
-    if args.model == "ae":
-        extra["ae_latent_mode"] = args.ae_latent_mode
-        extra["ae_kl_beta"] = args.ae_kl_beta if args.ae_latent_mode == "gaussian" else None
-        extra["generation_prior"] = (
-            "independent standard-normal spatial latent maps; trained with a Gaussian posterior and KL regularization"
-            if args.ae_latent_mode == "gaussian" else
-            "no learned prior; deterministic AE is reconstruction-only and uses local latent interpolation for diagnostics"
-        )
-        extra["generation_prior_parameters"] = 0
+    if model_type == "vqvae" and train_prior:
+        generation = train_code_prior(model, loaders["train"], p, device, run_dir)
+    elif model_type == "vae":
+        generation = {"prior": "standard-normal latent maps (the KL term trains the VAE towards N(0, I))"}
     else:
-        extra.update(train_code_prior(model, loaders["train"], args, device, args.run_dir))
-        extra["generation_prior"] = "PixelCNN-like autoregressive prior trained on training-split code maps"
+        generation = {"prior": "not trained"}
 
-    peak_memory_mb = None
-    if device.type == "cuda":
-        peak_memory_mb = float(torch.cuda.max_memory_allocated(device) / (1024 ** 2))
-    final_summary = {
-        "model": args.model,
+    summary = {
+        "model": model_type,
+        "params": asdict(p),
         "model_parameters": n_parameters,
         "device": str(device),
-        "gpu_name": torch.cuda.get_device_name(device) if device.type == "cuda" else None,
-        "seed": args.seed,
-        "group_id_verified": groups_verified,
-        "split_group_counts": split_json["split_group_counts"],
-        "split_image_counts": split_json["split_image_counts"],
-        "epochs_requested": args.epochs,
-        "best_epoch": int(checkpoint["epoch"]),
+        "split_image_counts": image_counts,
+        "best_epoch": best_epoch,
         "training_wall_seconds": training_seconds,
-        "total_training_plus_prior_wall_seconds": training_seconds + float(extra.get("prior_training_seconds", 0.0) or 0.0),
-        "peak_cuda_memory_mb": peak_memory_mb,
+        "total_training_plus_prior_wall_seconds": training_seconds + generation.get("prior_training_seconds", 0.0),
+        "peak_cuda_memory_mb": torch.cuda.max_memory_allocated(device) / 1024**2 if device.type == "cuda" else None,
         "best_validation_metrics": checkpoint["validation_metrics"],
-        "held_out_test_metrics": test_metrics,
-        "generation": extra,
+        "held_out_test_metrics": test_m,
+        "generation": generation,
         "notes": [
-            ("The predefined directory split was preserved and case IDs were checked for overlap; verify the case-ID semantics against dataset documentation before making a formal patient-independent evaluation claim."
-             if args.split_mode == "predefined" else
-             "Test metrics are final only when the manifest and source-group mapping have been verified."),
-            "SSIM here measures paired input/reconstruction similarity, not unpaired synthetic-image fidelity.",
-            ("The Gaussian AE was trained with sampled posterior latent maps and KL regularization, then generates from standard-normal latent maps; inspect image quality and nearest neighbours because a Gaussian prior does not guarantee anatomical plausibility."
-             if args.model == "ae" and args.ae_latent_mode == "gaussian" else
-             "The deterministic AE is reconstruction-only and has no learned sampling prior; its generated diagnostics use local latent interpolation."),
+            "Splits follow the dataset's own train/validate/test folders; case IDs were checked for overlap.",
+            "SSIM measures paired input/reconstruction similarity, not the fidelity of generated images.",
         ],
     }
-    save_json(args.run_dir / "run_summary.json", final_summary)
-    print(f"Best validation SSIM: {best_val_ssim:.4f}; held-out test SSIM: {test_metrics['ssim']:.4f}")
-    print(f"Run artifacts: {args.run_dir}")
-    if not groups_verified:
-        print("RESULT QUALIFICATION: group mapping is unverified; treat all scores as pipeline smoke-test results only.")
+    save_json(run_dir / "run_summary.json", summary)
+    print(f"Best validation SSIM: {best_ssim:.4f} (epoch {best_epoch}); held-out test SSIM: {test_m['ssim']:.4f}")
+    print(f"Run artifacts: {run_dir}")
+    return summary
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Train a VAE or VQ-VAE on 2D HipMRI NIfTI slices")
+    parser.add_argument("--model", choices=MODELS, required=True)
+    parser.add_argument("--data-root", type=Path, required=True, help="Folder containing the keras_slices_* directories")
+    parser.add_argument("--manifest", type=Path, default=MANIFEST, help="CSV created by `dataset.py audit`")
+    add_overrides(parser, TrainParams())  # any params.py default can be overridden, e.g. --epochs 5
+    args = parser.parse_args()
+    try:
+        params = apply_overrides(TrainParams(), args)
+    except ValueError as exc:
+        parser.error(str(exc))
+    run_dir = RUNS_DIR / run_dir_name(args.model, params)
+    print(f"Run directory: {run_dir.resolve()}")
+    train_model(args.model, params, args.data_root, args.manifest, run_dir)
 
 
 if __name__ == "__main__":
