@@ -113,4 +113,4 @@ def changed_suffix(params: TrainParams, model: str | None = None) -> str:
 
 def run_dir_name(model: str, params: TrainParams) -> str:
     """runs/{model}_seed{seed}x{epochs}[-param]x{value}..."""
-    return f"{model}_seed{params.seed}x{params.epochs}{changed_suffix(params, model)}"
+    return f"{model}_seedx{params.seed}-epochsx{params.epochs}{changed_suffix(params, model)}"

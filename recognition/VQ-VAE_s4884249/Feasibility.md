@@ -140,7 +140,7 @@ values. All files used `float32` data. The observed dimensions were `256 × 128`
 for `25,200` files and `256 × 144` for `120` files. The global observed
 intensity range was `[0, 1212]`.
 
-![Sample Grid](./images/sample_grid.png)
+![Sample Grid](images/sample_grid.png)
 
 The sample grid indicated that the directory may contain both MRI images and
 segmentation masks. Therefore, the total file count cannot yet be interpreted as
@@ -160,7 +160,7 @@ A small basic autoencoder will first be trained for a few epochs to verify data
 loading, GPU execution, loss computation, and image reconstruction. This will
 establish a working pipeline before introducing vector quantization.
 
-![Reconstruction Grid](./images/reconstruction_grid.png)
+![Reconstruction Grid](images/reconstruction_grid.png)
 
 The VQ-VAE will then be tested on a small subset of the dataset using a compact
 convolutional encoder-decoder, a modest codebook, and a limited number of

@@ -21,7 +21,8 @@ from torch.utils.data import DataLoader
 from dataset import NiftiSliceDataset
 from modules import CodePrior, build_model, count_parameters
 from params import PredictParams, add_overrides, apply_overrides
-from utils import get_device, read_json, save_image_grid, save_json, set_seed, ssim_2d, sync, write_csv
+from device_utils import get_device, peak_memory_mb, reset_peak_memory_stats, sync
+from utils import read_json, save_image_grid, save_json, set_seed, ssim_2d, write_csv
 
 
 def load_images(rows: Sequence[dict], data_root: Path, config: dict, batch_size: int) -> Tuple[torch.Tensor, List[str], List[str]]:
@@ -189,8 +190,7 @@ def main() -> None:
     model.load_state_dict(checkpoint["model_state_dict"])
     model.eval()
     splits = read_json(run_dir / "split.json")["splits"]
-    if device.type == "cuda":
-        torch.cuda.reset_peak_memory_stats(device)
+    reset_peak_memory_stats(device)
     total_start = time.perf_counter()
 
     # 1. Reconstruction metrics over the whole held-out test split.
@@ -315,6 +315,7 @@ def main() -> None:
         "resource_profile": {
             "model_parameters": count_parameters(model),
             "peak_cuda_memory_mb": torch.cuda.max_memory_allocated(device) / 1024**2 if device.type == "cuda" else None,
+            "peak_accelerator_memory_mb": peak_memory_mb(device),
             "total_predict_diagnostics_seconds": elapsed,
             "device": str(device),
         },

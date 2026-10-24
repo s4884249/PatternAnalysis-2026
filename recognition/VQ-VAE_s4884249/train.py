@@ -28,7 +28,8 @@ from torch.utils.data import DataLoader, TensorDataset
 from dataset import NiftiSliceDataset, load_manifest, split_from_manifest
 from modules import CodePrior, VQVAE, build_model, count_parameters
 from params import MANIFEST, MODELS, RUNS_DIR, TrainParams, add_overrides, apply_overrides, run_dir_name
-from utils import get_device, save_image_grid, save_json, set_seed, ssim_2d, to_device, write_csv
+from device_utils import get_device, peak_memory_mb, reset_peak_memory_stats
+from utils import save_image_grid, save_json, set_seed, ssim_2d, to_device, write_csv
 
 SSIM_TARGET = 0.6  # assignment target, drawn on the SSIM curve
 MAX_SNAPSHOTS = 10  # upper bound on columns in the progress images
@@ -144,7 +145,7 @@ def make_loaders(splits: Dict[str, List[dict]], data_root: Path, p: TrainParams)
             batch_size=p.batch_size,
             shuffle=(name == "train"),
             num_workers=p.workers,
-            pin_memory=torch.cuda.is_available(),
+            pin_memory=torch.cuda.is_available(),  # CUDA only; MPS does not use pinned-memory transfers
             persistent_workers=p.workers > 0,
             generator=generator if name == "train" else None,
         )
@@ -241,7 +242,7 @@ def train_model(
     run_dir.mkdir(parents=True, exist_ok=True)
     set_seed(p.seed)
     device = get_device(p.device)
-    print(f"Device: {device}" + (f" ({torch.cuda.get_device_name(device)})" if device.type == "cuda" else ""))
+    print(f"Device: {device}" + (f" ({torch.cuda.get_device_name(device)})" if device.type == "cuda" else (" (Apple Silicon GPU)" if device.type == "mps" else "")))
 
     # Use the dataset's own train/val/test folders; masks and unreadable files are excluded.
     splits = split_from_manifest(load_manifest(manifest, data_root))
@@ -266,8 +267,7 @@ def train_model(
     model = build_model(model_type, config).to(device)
     n_parameters = count_parameters(model)
     print(f"Model parameters: {n_parameters:,}")
-    if device.type == "cuda":
-        torch.cuda.reset_peak_memory_stats(device)
+    reset_peak_memory_stats(device)
 
     optimizer = torch.optim.Adam(model.parameters(), lr=p.lr)
     snapshots = snapshot_epochs(p.epochs)
@@ -338,6 +338,7 @@ def train_model(
         "training_wall_seconds": training_seconds,
         "total_training_plus_prior_wall_seconds": training_seconds + generation.get("prior_training_seconds", 0.0),
         "peak_cuda_memory_mb": torch.cuda.max_memory_allocated(device) / 1024**2 if device.type == "cuda" else None,
+        "peak_accelerator_memory_mb": peak_memory_mb(device),
         "best_validation_metrics": checkpoint["validation_metrics"],
         "held_out_test_metrics": test_m,
         "generation": generation,

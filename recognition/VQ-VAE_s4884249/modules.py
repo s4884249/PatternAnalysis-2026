@@ -146,7 +146,8 @@ class VectorQuantizer(nn.Module):
 
         # Perplexity = exp(entropy of code usage) ~ number of codes in effective use;
         # a value far below codebook_size signals codebook collapse.
-        counts = torch.bincount(indices, minlength=self.num_embeddings).to(z_e.dtype)
+        counts = torch.zeros(self.num_embeddings, device=indices.device, dtype=z_e.dtype)
+        counts.scatter_add_(0, indices, torch.ones_like(indices, dtype=z_e.dtype))
         probabilities = counts / counts.sum().clamp_min(1.0)
         nonzero = probabilities > 0
         perplexity = torch.exp(-(probabilities[nonzero] * probabilities[nonzero].log()).sum())
