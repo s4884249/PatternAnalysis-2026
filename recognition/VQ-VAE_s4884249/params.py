@@ -20,7 +20,9 @@ EXPERIMENTS_DIR = Path("experiments")
 # Parameters that only affect one model. They are ignored (and left out of the
 # run name) for the other model, so identical runs never get different folders.
 MODEL_SPECIFIC = {
+    "vae_latent_dim": "vae",
     "kl_beta": "vae",
+    "latent_dim": "vqvae",
     "codebook_size": "vqvae",
     "commitment_beta": "vqvae",
     "prior_epochs": "vqvae",
@@ -38,13 +40,16 @@ class TrainParams:
     epochs: int = 50
     batch_size: int = 64
     lr: float = 2e-4  # Adam learning rate for the VAE / VQ-VAE
-    # 128x80 keeps the aspect ratio of the 256x128 and 256x144 slices (padded, not
-    # stretched). Both sides must be divisible by 8 (the encoder downsamples 8x).
+    # Only 256x128 slices are used; 128x64 is exactly 2x down with the same 2:1 ratio
+    # (no padding, no centring). Height must stay 2x width and both divisible by 8.
     image_height: int = 128
-    image_width: int = 80
+    image_width: int = 64
     base_channels: int = 32
-    latent_dim: int = 64
-    kl_beta: float = 0.1  # VAE: weight of the KL term against the MSE reconstruction loss
+    latent_dim: int = 64  # VQ-VAE: channels (embedding size) of each code in the 16x8 code grid
+    vae_latent_dim: int = 256  # VAE: size of the single global latent vector
+    # VAE: KL weight in nats-per-pixel units, equal to 2*sigma^2 of the implied Gaussian
+    # decoder. 0.01 -> sigma ~ 0.07. Raise for smoother/more sampleable, lower for sharper.
+    kl_beta: float = 0.01
     codebook_size: int = 256  # VQ-VAE: number of discrete codes
     commitment_beta: float = 0.25  # VQ-VAE: weight pulling encoder outputs to their codes
     prior_epochs: int = 15  # VQ-VAE: epochs for the PixelCNN-style code prior
@@ -52,7 +57,7 @@ class TrainParams:
     prior_lr: float = 2e-4
     workers: int = 4  # DataLoader worker processes
     limit_batches: int = 0  # Debug only: cap batches per epoch/evaluation (0 = all)
-    device: str = "auto"  # auto, cpu, cuda or cuda:0
+    device: str = "auto"  # auto, cpu, mps, cuda or cuda:0
 
     def __post_init__(self):
         if min(self.epochs, self.batch_size) < 1 or self.workers < 0:

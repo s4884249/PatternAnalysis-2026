@@ -15,6 +15,7 @@ import argparse
 import csv
 import re
 import sys
+from collections import Counter
 from pathlib import Path
 from typing import Dict, List, Sequence
 
@@ -28,6 +29,12 @@ MASK_TOKENS = ("mask", "label", "seg", "annotation", "groundtruth", "ground_trut
 FILENAME_PATTERN = re.compile(r"(?i)^(?:case|seg)[_-]?(?P<case>\d+)_week_(?P<week>\d+)_slice_(?P<slice>\d+)$")
 SPLIT_PATTERN = re.compile(r"keras_slices_(?:seg_)?(train|validate|test)")
 MANIFEST_FIELDS = ["path", "split", "kind", "group_id", "shape", "min", "max", "mean", "std", "nonzero_frac", "error"]
+
+# Only the 256x128 slices are used (the larger group). The 256x144 slices are dropped
+# rather than padded or stretched, so every training image has the same native
+# 2:1 aspect ratio and no artificial borders.
+SOURCE_SHAPE = (256, 128)
+SOURCE_SHAPE_TEXT = "x".join(map(str, SOURCE_SHAPE))
 
 
 def nifti_stem(path: Path) -> str:
@@ -130,18 +137,25 @@ def read_manifest(manifest_path: Path) -> List[Dict[str, str]]:
         return list(csv.DictReader(handle))
 
 
-def load_manifest(manifest_path: Path, data_root: Path) -> List[Dict[str, str]]:
-    """Return the readable image rows (path, split, group_id); masks and error rows are dropped."""
+def load_manifest(manifest_path: Path, data_root: Path, keep_shape: str = SOURCE_SHAPE_TEXT) -> List[Dict[str, str]]:
+    """Return the readable image rows (path, split, group_id); masks, error rows and
+    images whose shape is not `keep_shape` (default 256x128) are dropped."""
     data_root = data_root.expanduser().resolve()
     rows = []
+    dropped_shapes: Counter = Counter()
     for source in read_manifest(manifest_path):
         if source["kind"] != "image" or source["error"]:
+            continue
+        if keep_shape and source["shape"] != keep_shape:
+            dropped_shapes[source["shape"] or "unknown"] += 1
             continue
         if not (data_root / source["path"]).is_file():
             raise FileNotFoundError(f"Manifest file missing under --data-root: {data_root / source['path']}")
         rows.append({k: source[k] for k in ("path", "split", "group_id")})
+    if dropped_shapes:
+        print(f"Dropped images whose shape is not {keep_shape}: {dict(dropped_shapes)}; kept {len(rows)}")
     if not rows:
-        raise ValueError("The manifest contains no readable image rows")
+        raise ValueError(f"The manifest contains no readable {keep_shape} image rows")
     return rows
 
 
@@ -184,17 +198,23 @@ def normalize_mri(array: np.ndarray) -> np.ndarray:
 
 
 class NiftiSliceDataset(Dataset):
-    """Load one NIfTI slice at a time, resize it to fit the canvas and zero-pad.
+    """Load one NIfTI slice at a time and resize it to the full canvas (no padding).
 
-    The aspect ratio is preserved: a 256x128 slice becomes 128x64 and is centred on
-    the default 128x80 canvas instead of being stretched.
+    The canvas must have the same aspect ratio as the 256x128 source slices, so the
+    image is only scaled (default 128x64 = exactly 2x down) and never stretched,
+    cropped or centred on a larger canvas.
     """
 
-    def __init__(self, rows: Sequence[Dict[str, str]], data_root: Path, image_height: int = 128, image_width: int = 80):
+    def __init__(self, rows: Sequence[Dict[str, str]], data_root: Path, image_height: int = 128, image_width: int = 64):
         if image_height % 8 or image_width % 8:
             raise ValueError("image_height and image_width must both be divisible by 8")
         if min(image_height, image_width) < 32:
             raise ValueError("Image canvas must be at least 32 pixels on each side")
+        if image_height * SOURCE_SHAPE[1] != image_width * SOURCE_SHAPE[0]:
+            raise ValueError(
+                f"{image_height}x{image_width} does not keep the {SOURCE_SHAPE_TEXT} aspect ratio "
+                f"(height:width must be {SOURCE_SHAPE[0]}:{SOURCE_SHAPE[1]}, e.g. 128x64 or 64x32)"
+            )
         self.rows = list(rows)
         self.data_root = Path(data_root).expanduser().resolve()
         self.image_height = int(image_height)
@@ -206,16 +226,15 @@ class NiftiSliceDataset(Dataset):
     def __getitem__(self, index: int) -> Dict[str, object]:
         row = self.rows[index]
         array = normalize_mri(load_array(self.data_root / row["path"]))
-        scale = min(self.image_height / array.shape[0], self.image_width / array.shape[1])
-        new_h = max(1, round(array.shape[0] * scale))
-        new_w = max(1, round(array.shape[1] * scale))
-        resized = F.interpolate(
-            torch.from_numpy(array)[None, None], size=(new_h, new_w), mode="bilinear", align_corners=False
-        )[0]
-        canvas = torch.zeros((1, self.image_height, self.image_width), dtype=resized.dtype)
-        top, left = (self.image_height - new_h) // 2, (self.image_width - new_w) // 2
-        canvas[:, top : top + new_h, left : left + new_w] = resized
-        return {"image": canvas, "path": row["path"], "group_id": row["group_id"]}
+        if array.shape != SOURCE_SHAPE:
+            raise ValueError(f"{row['path']}: expected a {SOURCE_SHAPE_TEXT} slice, got {array.shape}")
+        image = torch.from_numpy(array)[None]
+        if tuple(array.shape) != (self.image_height, self.image_width):
+            image = F.interpolate(
+                image[None], size=(self.image_height, self.image_width), mode="bilinear",
+                align_corners=False, antialias=True,
+            )[0]
+        return {"image": image.contiguous(), "path": row["path"], "group_id": row["group_id"]}
 
 
 def main() -> None:

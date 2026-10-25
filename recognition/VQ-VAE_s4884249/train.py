@@ -165,6 +165,29 @@ def collect_code_maps(model: VQVAE, loader: DataLoader, device: torch.device, li
     return torch.cat(maps, dim=0)
 
 
+@torch.no_grad()
+def fit_vae_latent_prior(model, loader: DataLoader, device: torch.device, limit_batches: int = 0) -> dict:
+    """Fit a full-covariance Gaussian to the training-split latents (post-hoc density fitting).
+
+    A VAE's aggregate posterior rarely matches N(0, I) exactly, so decoding z ~ N(0, I)
+    often lands in latent regions the decoder never saw. Sampling from a Gaussian fitted
+    to the encoded training images (mean of the posterior means, covariance of the means
+    plus the average posterior variance) fixes that without retraining. Training split only.
+    """
+    model.eval()
+    means, variances = [], []
+    for index, batch in enumerate(loader):
+        if limit_batches and index >= limit_batches:
+            break
+        mu, logvar = model.encode_distribution(to_device(batch, device))
+        means.append(mu.float().cpu())
+        variances.append(logvar.float().exp().cpu())
+    mu, var = torch.cat(means), torch.cat(variances)
+    dim = mu.shape[1]
+    cov = torch.cov(mu.T) + torch.diag(var.mean(0)) + 1e-5 * torch.eye(dim, dtype=torch.float64)
+    return {"mean": mu.mean(0).float().clone(), "cholesky": torch.linalg.cholesky(cov).float().clone(), "n_images": int(mu.shape[0])}
+
+
 def train_code_prior(model: VQVAE, train_loader: DataLoader, p: TrainParams, device: torch.device, run_dir: Path) -> dict:
     """Fit the autoregressive prior on training-split code maps only (no test leakage)."""
     code_maps = collect_code_maps(model, train_loader, device, p.limit_batches)
@@ -324,7 +347,12 @@ def train_model(
     if model_type == "vqvae" and train_prior:
         generation = train_code_prior(model, loaders["train"], p, device, run_dir)
     elif model_type == "vae":
-        generation = {"prior": "standard-normal latent maps (the KL term trains the VAE towards N(0, I))"}
+        latent_prior = fit_vae_latent_prior(model, loaders["train"], device, p.limit_batches)
+        torch.save(latent_prior, run_dir / "latent_prior.pt")
+        generation = {
+            "prior": "full-covariance Gaussian fitted to training-split latents (latent_prior.pt)",
+            "latent_prior_train_images": latent_prior["n_images"],
+        }
     else:
         generation = {"prior": "not trained"}
 

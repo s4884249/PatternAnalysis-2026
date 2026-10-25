@@ -53,11 +53,11 @@ def reconstruct(model, images: torch.Tensor, device: torch.device, batch_size: i
 
 @torch.inference_mode()
 def encode_features(model, images: torch.Tensor, device: torch.device, batch_size: int) -> torch.Tensor:
-    """Spatial mean of the continuous encoder output: one feature vector per image."""
-    features = [
-        model.encode(images[i : i + batch_size].to(device)).mean(dim=(2, 3)).cpu()
-        for i in range(0, len(images), batch_size)
-    ]
+    """One feature vector per image: the VAE posterior mean, or the spatial mean of the VQ-VAE encoder map."""
+    features = []
+    for i in range(0, len(images), batch_size):
+        z = model.encode(images[i : i + batch_size].to(device))
+        features.append((z.mean(dim=(2, 3)) if z.ndim == 4 else z).cpu())
     return torch.cat(features)
 
 
@@ -86,7 +86,8 @@ def generate_samples(
 ) -> Tuple[torch.Tensor, float, int | None]:
     """Draw new images; returns (samples, seconds for sampling + decoding, prior parameter count).
 
-    VAE:    decode z ~ N(0, I), the distribution its KL term was trained towards.
+    VAE:    decode a global z drawn from the Gaussian fitted to the training latents
+            (latent_prior.pt); falls back to N(0, I) if that file is missing.
     VQ-VAE: sample code grids from the learned prior, then decode the codes.
     """
     generator = torch.Generator(device=device).manual_seed(seed)  # reproducible, device-matched
@@ -108,7 +109,14 @@ def generate_samples(
             codes = prior.sample(num_samples, *latent_hw, device, temperature=temperature, generator=generator)
             samples = model.decode_indices(codes)
         else:
-            z = torch.randn((num_samples, model.latent_dim, *latent_hw), device=device, generator=generator)
+            eps = torch.randn((num_samples, model.latent_dim), device=device, generator=generator)
+            prior_file = run_dir / "latent_prior.pt"
+            if prior_file.is_file():  # Gaussian fitted to the training latents by train.py
+                state = torch.load(prior_file, map_location=device, weights_only=True)
+                z = state["mean"].to(device) + eps @ state["cholesky"].to(device).T
+            else:
+                print("latent_prior.pt not found; sampling from N(0, I), which usually gives poor VAE samples.")
+                z = eps
             samples = model.decode(z)
         sync(device)
         seconds = time.perf_counter() - tick
@@ -215,7 +223,7 @@ def main() -> None:
     test_nn_mse, _ = nearest_mse(audit_images, ref_images, device)
 
     # 3. New samples.
-    latent_hw = (config["image_height"] // 8, config["image_width"] // 8)  # the encoder downsamples 8x
+    latent_hw = (config["image_height"] // 8, config["image_width"] // 8)  # VQ-VAE code grid; the encoder downsamples 8x
     samples, sampling_seconds, prior_parameters = generate_samples(
         model, model_type, run_dir, p.num_samples, device, latent_hw, p.temperature, p.seed
     )
@@ -291,7 +299,11 @@ def main() -> None:
             "latency_seconds_per_sample": sampling_seconds / len(samples),
             "prior_parameters": prior_parameters,
             "temperature": p.temperature if model_type == "vqvae" else None,
-            "method": "learned PixelCNN-style code prior" if model_type == "vqvae" else "independent standard-normal latent maps",
+            "method": (
+                "learned PixelCNN-style code prior" if model_type == "vqvae"
+                else "Gaussian fitted to training latents" if (run_dir / "latent_prior.pt").is_file()
+                else "global standard-normal latent vector (no latent_prior.pt)"
+            ),
             "warning": "Inspect visual plausibility, diversity and nearest training neighbours; a prior does not guarantee anatomical plausibility.",
         },
         "nearest_neighbor_audit": {
@@ -304,7 +316,7 @@ def main() -> None:
             "interpretation": "Pixel MSE after 4x downsampling. A small distance is a review trigger, not proof of memorisation; a large one is not proof of privacy.",
         },
         "latent_feature_coverage_proxy": {
-            "embedding": "spatial mean of the model's continuous encoder output",
+            "embedding": "VAE posterior mean, or spatial mean of the VQ-VAE continuous encoder output",
             "epsilon": epsilon,
             "heldout_test_coverage_by_generated_set": coverage,
             "test_to_train_nearest_latent_distance_mean": float(test_to_train.mean()),

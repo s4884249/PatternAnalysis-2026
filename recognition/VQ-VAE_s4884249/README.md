@@ -127,7 +127,7 @@ def normalize_mri(array: np.ndarray) -> np.ndarray:
 
 The function `normalize_mri` is used to ensure the samples are normalised to a consistent intensity and avoid a few very bright voxels from compressing the useful range.
 
-```
+```console
 == Files ==
 manifest rows: 25320 | readable: 25320 | unreadable: 0
 images: 12660 | masks: 12660
@@ -171,14 +171,39 @@ per-slice mean: min 0.1012 | median 0.1622 | mean 0.1719 | max 0.2863 | std 0.04
 Overall there are `12660` usable images broken into an approximate 90/5/5 percent train/validate/test split that will be utilised throughout the project. Where patient identifiers or source-volume information are available, slices from the same patient or volume will be kept within a single split to reduce data leakage. The training set will be used to learn model parameters, the validation set to select configurations and checkpoints, and the test set reserved for final evaluation.
 
 ```python
-# !!TODO!! input code if necessay
+# See `dataset.py`
+def load_manifest(manifest_path: Path, data_root: Path, keep_shape: str = SOURCE_SHAPE_TEXT) -> List[Dict[str, str]]:
+    """Return the readable image rows (path, split, group_id); masks, error rows and
+    images whose shape is not `keep_shape` (default 256x128) are dropped."""
+    data_root = data_root.expanduser().resolve()
+    rows = []
+    dropped_shapes: Counter = Counter()
+    for source in read_manifest(manifest_path):
+        if source["kind"] != "image" or source["error"]:
+            continue
+        if keep_shape and source["shape"] != keep_shape:
+            dropped_shapes[source["shape"] or "unknown"] += 1
+            continue
+        if not (data_root / source["path"]).is_file():
+            raise FileNotFoundError(f"Manifest file missing under --data-root: {data_root / source['path']}")
+        rows.append({k: source[k] for k in ("path", "split", "group_id")})
+    if dropped_shapes:
+        print(f"Dropped images whose shape is not {keep_shape}: {dict(dropped_shapes)}; kept {len(rows)}")
+    if not rows:
+        raise ValueError(f"The manifest contains no readable {keep_shape} image rows")
+    return rows
+
+```
+
+```console
+Dropped images whose shape is not 256x128: {'256x144': 60}; kept 12600
 ```
 
 To avoid dealing with sample images of to different sizes and the streching or black bars produced in an attempt of normalisation, the `0.5%` of images in the datase with a `256x144` resolution were ommited from the data dataset resulting in a final count of `12600` usable images.
 
 ## File Structure
 
-```
+```console
 recognition/VQ-VAE_s4884249/
 ├── dataset.py
 ├── images
@@ -318,6 +343,23 @@ As obseved above, thile the VQ-VAE was able to generate passable samples, the or
 
 > **Takeaway**
 Increasing or decreasing computing power will not affect the quality or accuracy of the generated sample.
+
+### Version 5
+
+In addition to now dropping the `256x144` images and maintaining the original aspect ration, the VAE issue with the generation of new samples was solved. The main problem was that the old VAE had too much spatially independent latent information and no mechanism to learn the spatial correlations needed for realistic anatomy. It reconstructed images well but was not necessarily able to generate realistic new ones.
+
+The VAE was changed from a high-dimensional spatial latent representation to a compact, globally regularised latent vector, with revised KL scaling to improve the potential quality of random samples.
+
+The latent representation eas changed from a spatial latent map of `64 × 16 × 10 = 10,240` values to a single global latent vector of `256` values per image. This creates a stronger bottleneck and encourages the model to represent the overall image structure. The KL loss was adjusted to encourage latent vectors to follow a standard normal distribution, N(0,I), making random sampling more consistent with the decoder's training di stribution. Finally, the KL term was changed to be summed over latent dimensions and divided by the number of image pixels. The default kl_beta is now `0.01`, providing a tunable balance between reconstruction quality and latent regularisation.
+Results and expected impact
+
+![Generated Samples](images/version5_vae_generated_samples.png)
+_VAE - Generated Samples_
+
+![Generated Samples](images/version5_vq-vae_generated_samples.png)
+_VQ-VAE - Generated Samples_
+
+Overall, the generated anatomy was more coherent because the decoder receives a compact global representation rather than an independently sampled spatial latent map. The trade-off being that the MSE reconstruction loss may still produce blurry images. Additionally, with the `256x144` samples removes, there are no longer black bars on the edges.
 
 ## Training
 
