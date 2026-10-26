@@ -223,7 +223,8 @@ def main() -> None:
     test_nn_mse, _ = nearest_mse(audit_images, ref_images, device)
 
     # 3. New samples.
-    latent_hw = (config["image_height"] // 8, config["image_width"] // 8)  # VQ-VAE code grid; the encoder downsamples 8x
+    factor = 2 ** int(config.get("downsample_stages", 3))  # the encoder downsamples 4x or 8x
+    latent_hw = (config["image_height"] // factor, config["image_width"] // factor)  # VQ-VAE code grid
     samples, sampling_seconds, prior_parameters = generate_samples(
         model, model_type, run_dir, p.num_samples, device, latent_hw, p.temperature, p.seed
     )

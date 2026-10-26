@@ -10,6 +10,11 @@ from typing import Dict, Sequence
 
 import numpy as np
 import torch
+import torch.nn.functional as F
+
+# One implementation of device selection / syncing (CUDA, Apple MPS, CPU). Re-exported so every
+# script that imports them from utils gets MPS support too.
+from device_utils import get_device, sync  # noqa: F401
 
 
 def set_seed(seed: int) -> None:
@@ -21,21 +26,6 @@ def set_seed(seed: int) -> None:
     # Reproducibility is preferred over maximum throughput.
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
-
-
-def get_device(requested: str) -> torch.device:
-    if requested == "auto":
-        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    device = torch.device(requested)
-    if device.type == "cuda" and not torch.cuda.is_available():
-        raise RuntimeError("CUDA was requested but torch.cuda.is_available() is false")
-    return device
-
-
-def sync(device: torch.device) -> None:
-    """Wait for queued GPU work so wall-clock timings are accurate."""
-    if device.type == "cuda":
-        torch.cuda.synchronize(device)
 
 
 def to_device(batch: Dict[str, object], device: torch.device) -> torch.Tensor:
@@ -55,6 +45,28 @@ def ssim_2d(real: np.ndarray, recon: np.ndarray) -> float:
             use_sample_covariance=False,
         )
     )
+
+
+def ssim_torch(real: torch.Tensor, recon: torch.Tensor, window: int = 11, sigma: float = 1.5) -> torch.Tensor:
+    """Differentiable mean SSIM of [N, 1, H, W] images in [0, 1] (Gaussian window, valid padding).
+
+    Same constants and window as `ssim_2d`, so it tracks the evaluation metric closely.
+    """
+    coords = torch.arange(window, dtype=real.dtype, device=real.device) - (window - 1) / 2.0
+    kernel_1d = torch.exp(-(coords**2) / (2 * sigma**2))
+    kernel_1d = kernel_1d / kernel_1d.sum()
+    kernel = (kernel_1d[:, None] * kernel_1d[None, :])[None, None]
+
+    def blur(x: torch.Tensor) -> torch.Tensor:
+        return F.conv2d(x, kernel)
+
+    mu_x, mu_y = blur(real), blur(recon)
+    var_x = blur(real * real) - mu_x * mu_x
+    var_y = blur(recon * recon) - mu_y * mu_y
+    cov = blur(real * recon) - mu_x * mu_y
+    c1, c2 = 0.01**2, 0.03**2
+    ssim_map = ((2 * mu_x * mu_y + c1) * (2 * cov + c2)) / ((mu_x**2 + mu_y**2 + c1) * (var_x + var_y + c2))
+    return ssim_map.mean()
 
 
 def save_json(path: Path, obj: object) -> None:

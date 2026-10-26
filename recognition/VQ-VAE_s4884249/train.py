@@ -5,9 +5,14 @@ with that checkpoint. The VQ-VAE then fits a PixelCNN-style prior on training-sp
 code maps so it can generate new images. All settings live in params.py; the run
 directory is derived from them (see params.run_dir_name).
 
-Progress images (at most 10 columns, evenly spaced epochs):
+Progress images (at most 10 columns, evenly spaced epochs; the same epochs for the first two):
     reconstructions_by_epoch.png  fixed validation image: input + reconstruction per snapshot
-    prior_samples_by_epoch.png    VQ-VAE only: one prior sample per snapshot
+    generated_samples_by_epoch.png  one NEW image per snapshot (fixed random seed, so columns differ only
+                                  because the model changed). VAE: decoded from a Gaussian fitted to the
+                                  current training latents. VQ-VAE: decoded from codes drawn independently
+                                  per grid position from the current training-code frequencies, a cheap
+                                  stand-in because the real PixelCNN prior is only trained after the VQ-VAE.
+    prior_samples_by_epoch.png    VQ-VAE only: one sample from the final PixelCNN prior per prior epoch
 """
 
 from __future__ import annotations
@@ -29,7 +34,7 @@ from dataset import NiftiSliceDataset, load_manifest, split_from_manifest
 from modules import CodePrior, VQVAE, build_model, count_parameters
 from params import MANIFEST, MODELS, RUNS_DIR, TrainParams, add_overrides, apply_overrides, run_dir_name
 from device_utils import get_device, peak_memory_mb, reset_peak_memory_stats
-from utils import save_image_grid, save_json, set_seed, ssim_2d, to_device, write_csv
+from utils import save_image_grid, save_json, set_seed, ssim_2d, ssim_torch, to_device, write_csv
 
 SSIM_TARGET = 0.6  # assignment target, drawn on the SSIM curve
 MAX_SNAPSHOTS = 10  # upper bound on columns in the progress images
@@ -45,21 +50,29 @@ def snapshot_epochs(total: int) -> set:
     return set(range(step, total + 1, step)) | {total}
 
 
-def compute_loss(model, images: torch.Tensor, model_type: str) -> Tuple[torch.Tensor, Dict[str, float], dict]:
+def compute_loss(
+    model, images: torch.Tensor, model_type: str, ssim_weight: float = 0.0
+) -> Tuple[torch.Tensor, Dict[str, float], dict]:
     """Return the total loss, a dict of float metrics and the raw model output.
 
-    VAE:    MSE + kl_beta * KL
-    VQ-VAE: MSE + codebook loss + commitment loss (the weight is applied in the quantiser)
-    MSE on [0, 1] intensities is the reconstruction term for both, so scores are comparable.
+    VAE:    reconstruction + kl_beta * KL
+    VQ-VAE: reconstruction + codebook loss + commitment loss (the weight is applied in the quantiser)
+    reconstruction = MSE on [0, 1] intensities (+ ssim_weight * (1 - SSIM) when ssim_weight > 0),
+    identical for both models so scores stay comparable.
     """
     output = model(images)
     mse = F.mse_loss(output["reconstruction"], images)
+    reconstruction_term, extra = mse, {}
+    if ssim_weight > 0:
+        ssim_loss = 1.0 - ssim_torch(images, output["reconstruction"])
+        reconstruction_term = mse + ssim_weight * ssim_loss
+        extra["ssim_loss"] = ssim_loss
     if model_type == "vae":
-        loss = mse + model.kl_beta * output["kl_loss"]
-        extra = {"kl_loss": output["kl_loss"]}
+        loss = reconstruction_term + model.kl_beta * output["kl_loss"]
+        extra["kl_loss"] = output["kl_loss"]
     else:
-        loss = mse + output["codebook_loss"] + output["commitment_loss"]
-        extra = {k: output[k] for k in ("codebook_loss", "commitment_loss", "perplexity", "active_codes")}
+        loss = reconstruction_term + output["codebook_loss"] + output["commitment_loss"]
+        extra |= {k: output[k] for k in ("codebook_loss", "commitment_loss", "perplexity", "active_codes")}
     metrics = {"loss": loss, "reconstruction_mse": mse, **extra}
     return loss, {name: float(value.detach()) for name, value in metrics.items()}, output
 
@@ -72,6 +85,7 @@ def run_epoch(
     optimizer: torch.optim.Optimizer | None = None,
     limit_batches: int = 0,
     with_ssim: bool = False,
+    ssim_weight: float = 0.0,
 ) -> Dict[str, float]:
     """One pass over `loader`: trains if an optimizer is given, otherwise evaluates.
 
@@ -87,7 +101,7 @@ def run_epoch(
             if limit_batches and index >= limit_batches:
                 break
             images = to_device(batch, device)
-            loss, metrics, output = compute_loss(model, images, model_type)
+            loss, metrics, output = compute_loss(model, images, model_type, ssim_weight)
             if training:
                 if not torch.isfinite(loss):
                     raise FloatingPointError(f"Non-finite loss at batch {index}: {loss.item()}")
@@ -115,7 +129,7 @@ def reconstruct_one(model, image: torch.Tensor, device: torch.device) -> torch.T
     return model(image[None].to(device))["reconstruction"].clamp(0, 1)[0].cpu()
 
 
-def plot_history(run_dir: Path, history: List[dict]) -> None:
+def plot_history(run_dir: Path, history: List[dict], model_type: str = "") -> None:
     import matplotlib
 
     matplotlib.use("Agg")
@@ -123,8 +137,13 @@ def plot_history(run_dir: Path, history: List[dict]) -> None:
 
     epochs = [row["epoch"] for row in history]
     fig, (loss_ax, ssim_ax) = plt.subplots(1, 2, figsize=(11, 4))
-    loss_ax.plot(epochs, [row["train_loss"] for row in history], label="train total loss")
-    loss_ax.plot(epochs, [row["val_loss"] for row in history], label="validation total loss")
+    # A VAE trains with sampled latents but is evaluated with the posterior mean, so its two
+    # curves are not measured the same way; say so rather than imply a like-for-like gap.
+    train_label, val_label = "train total loss", "validation total loss"
+    if model_type == "vae":
+        train_label, val_label = "train total loss (sampled z)", "validation total loss (mean z)"
+    loss_ax.plot(epochs, [row["train_loss"] for row in history], label=train_label)
+    loss_ax.plot(epochs, [row["val_loss"] for row in history], label=val_label)
     loss_ax.set(xlabel="Epoch", ylabel="Loss")
     ssim_ax.plot(epochs, [row["val_ssim"] for row in history], label="validation SSIM")
     ssim_ax.axhline(SSIM_TARGET, linestyle="--", color="gray", label=f"assignment target {SSIM_TARGET}")
@@ -138,19 +157,32 @@ def plot_history(run_dir: Path, history: List[dict]) -> None:
 
 
 def make_loaders(splits: Dict[str, List[dict]], data_root: Path, p: TrainParams) -> Dict[str, DataLoader]:
+    """train / val / test loaders plus `train_eval`: the training images in a fixed order that
+    never touches the training shuffle, used for fitting priors and progress samples."""
     generator = torch.Generator().manual_seed(p.seed)  # reproducible training shuffle order
-    return {
-        name: DataLoader(
-            NiftiSliceDataset(rows, data_root, p.image_height, p.image_width),
-            batch_size=p.batch_size,
-            shuffle=(name == "train"),
-            num_workers=p.workers,
-            pin_memory=torch.cuda.is_available(),  # CUDA only; MPS does not use pinned-memory transfers
-            persistent_workers=p.workers > 0,
-            generator=generator if name == "train" else None,
+    cache = bool(p.cache_data)
+    workers = 0 if cache else p.workers  # cached tensors need no worker processes
+    loaders: Dict[str, DataLoader] = {}
+    for name, rows in splits.items():
+        dataset = NiftiSliceDataset(
+            rows, data_root, p.image_height, p.image_width, cache=cache, threads=max(1, p.workers)
         )
-        for name, rows in splits.items()
-    }
+
+        def build(shuffle: bool, gen=None) -> DataLoader:
+            return DataLoader(
+                dataset,
+                batch_size=p.batch_size,
+                shuffle=shuffle,
+                num_workers=workers,
+                pin_memory=torch.cuda.is_available(),  # CUDA only; MPS does not use pinned-memory transfers
+                persistent_workers=workers > 0,
+                generator=gen,
+            )
+
+        loaders[name] = build(name == "train", generator if name == "train" else None)
+        if name == "train":
+            loaders["train_eval"] = build(False)
+    return loaders
 
 
 @torch.inference_mode()
@@ -180,17 +212,68 @@ def fit_vae_latent_prior(model, loader: DataLoader, device: torch.device, limit_
         if limit_batches and index >= limit_batches:
             break
         mu, logvar = model.encode_distribution(to_device(batch, device))
-        means.append(mu.float().cpu())
-        variances.append(logvar.float().exp().cpu())
+        # MPS has no float64: move to the CPU first, then widen for a well-conditioned covariance.
+        means.append(mu.cpu().double())
+        variances.append(logvar.cpu().double().exp())
     mu, var = torch.cat(means), torch.cat(variances)
     dim = mu.shape[1]
     cov = torch.cov(mu.T) + torch.diag(var.mean(0)) + 1e-5 * torch.eye(dim, dtype=torch.float64)
     return {"mean": mu.mean(0).float().clone(), "cholesky": torch.linalg.cholesky(cov).float().clone(), "n_images": int(mu.shape[0])}
 
 
-def train_code_prior(model: VQVAE, train_loader: DataLoader, p: TrainParams, device: torch.device, run_dir: Path) -> dict:
-    """Fit the autoregressive prior on training-split code maps only (no test leakage)."""
+@torch.no_grad()
+def generate_snapshot_sample(model, model_type: str, loader: DataLoader, device: torch.device, p: TrainParams) -> torch.Tensor:
+    """One new [1, H, W] image from the CURRENT weights for the generated_samples_by_epoch strip.
+
+    The random numbers come from a fresh generator with the run's seed on every call, so
+    successive snapshots use identical noise and differ only because the model improved.
+    VAE:    z ~ Gaussian fitted to the current training latents (as in the final latent prior).
+    VQ-VAE: each grid position's code is drawn independently from that position's code
+            frequencies over the training split. This is only a stand-in for the PixelCNN prior
+            (which cannot exist until the VQ-VAE has finished training), so expect less
+            coherent images than prior_samples_by_epoch.png.
+    """
+    model.eval()
+    generator = torch.Generator().manual_seed(p.seed)  # CPU generator: identical on CUDA / MPS / CPU
+    if model_type == "vae":
+        prior = fit_vae_latent_prior(model, loader, device, p.limit_batches)
+        eps = torch.randn((1, model.latent_dim), generator=generator)
+        z = prior["mean"] + eps @ prior["cholesky"].T
+        return model.decode(z.to(device)).clamp(0, 1)[0].cpu()
+    codes = collect_code_maps(model, loader, device, p.limit_batches)  # [N, H, W]
+    n, height, width = codes.shape
+    counts = torch.zeros(height * width, model.codebook_size)
+    counts.scatter_add_(1, codes.reshape(n, -1).t(), torch.ones(height * width, n))
+    sampled = torch.multinomial(counts, 1, generator=generator).reshape(1, height, width)
+    return model.decode_indices(sampled.to(device)).clamp(0, 1)[0].cpu()
+
+
+@torch.no_grad()
+def code_cross_entropy(prior: CodePrior, code_maps: torch.Tensor, batch_size: int, device: torch.device) -> float:
+    """Mean next-code cross-entropy (nats per position) of `prior` on a set of code maps."""
+    prior.eval()
+    total, count = 0.0, 0
+    for (indices,) in DataLoader(TensorDataset(code_maps), batch_size=batch_size):
+        indices = indices.to(device=device, dtype=torch.long)
+        logits = prior(indices)
+        flat = F.cross_entropy(logits.permute(0, 2, 3, 1).reshape(-1, prior.codebook_size), indices.reshape(-1), reduction="sum")
+        total += float(flat)
+        count += indices.numel()
+    return total / count
+
+
+def train_code_prior(
+    model: VQVAE, train_loader: DataLoader, p: TrainParams, device: torch.device, run_dir: Path,
+    val_loader: DataLoader | None = None,
+) -> dict:
+    """Fit the autoregressive prior on training-split code maps only (no test leakage).
+
+    With a validation loader the prior is also scored on validation code maps every epoch,
+    training stops after `prior_patience` epochs without improvement and the best weights
+    are restored, so an over-fitted prior is not what gets saved.
+    """
     code_maps = collect_code_maps(model, train_loader, device, p.limit_batches)
+    val_maps = collect_code_maps(model, val_loader, device, p.limit_batches) if val_loader is not None else None
     height, width = code_maps.shape[1:]
     loader = DataLoader(TensorDataset(code_maps), batch_size=p.batch_size, shuffle=True)
     prior = CodePrior(codebook_size=p.codebook_size, hidden_channels=p.prior_hidden).to(device)
@@ -199,6 +282,7 @@ def train_code_prior(model: VQVAE, train_loader: DataLoader, p: TrainParams, dev
     snapshots = snapshot_epochs(p.prior_epochs)
     frames, titles = [], []
     history = []
+    best_ce, best_epoch, best_state = float("inf"), 0, None
     start = time.perf_counter()
     for epoch in range(1, p.prior_epochs + 1):
         prior.train()
@@ -216,8 +300,16 @@ def train_code_prior(model: VQVAE, train_loader: DataLoader, p: TrainParams, dev
             optimizer.step()
             total += float(loss.detach()) * indices.shape[0]
             count += indices.shape[0]
-        history.append({"epoch": epoch, "train_cross_entropy": total / count})
-        print(f"[prior] epoch {epoch:03d}/{p.prior_epochs:03d} | train CE={total / count:.5f}")
+        row = {"epoch": epoch, "train_cross_entropy": total / count}
+        message = f"[prior] epoch {epoch:03d}/{p.prior_epochs:03d} | train CE={total / count:.5f}"
+        if val_maps is not None:
+            row["val_cross_entropy"] = code_cross_entropy(prior, val_maps, p.batch_size, device)
+            message += f" val CE={row['val_cross_entropy']:.5f}"
+            if row["val_cross_entropy"] < best_ce:
+                best_ce, best_epoch = row["val_cross_entropy"], epoch
+                best_state = {k: v.detach().clone() for k, v in prior.state_dict().items()}
+        history.append(row)
+        print(message)
 
         if epoch in snapshots:
             # Same generator seed every time, so columns differ only because the prior improved.
@@ -229,7 +321,12 @@ def train_code_prior(model: VQVAE, train_loader: DataLoader, p: TrainParams, dev
             frames.append(sample)
             titles.append(f"Prior epoch {epoch}")
             save_image_grid(torch.stack(frames), run_dir / "prior_samples_by_epoch.png", titles, ncols=len(frames))
+        if val_maps is not None and p.prior_patience and epoch - best_epoch >= p.prior_patience:
+            print(f"[prior] no validation improvement for {p.prior_patience} epochs; stopping (best epoch {best_epoch})")
+            break
     elapsed = time.perf_counter() - start
+    if best_state is not None:
+        prior.load_state_dict(best_state)
 
     torch.save(
         {
@@ -243,14 +340,18 @@ def train_code_prior(model: VQVAE, train_loader: DataLoader, p: TrainParams, dev
         run_dir / "prior.pt",
     )
     write_csv(run_dir / "prior_history.csv", history)
-    return {
+    summary = {
         "prior": "PixelCNN-like autoregressive prior trained on training-split code maps",
         "train_code_maps": int(code_maps.shape[0]),
         "latent_shape": [int(height), int(width)],
         "prior_parameters": count_parameters(prior),
         "prior_training_seconds": elapsed,
+        "prior_epochs_run": len(history),
         "final_train_cross_entropy": history[-1]["train_cross_entropy"],
     }
+    if best_state is not None:
+        summary |= {"prior_best_epoch": best_epoch, "best_val_cross_entropy": best_ce}
+    return summary
 
 
 def train_model(
@@ -268,7 +369,7 @@ def train_model(
     print(f"Device: {device}" + (f" ({torch.cuda.get_device_name(device)})" if device.type == "cuda" else (" (Apple Silicon GPU)" if device.type == "mps" else "")))
 
     # Use the dataset's own train/val/test folders; masks and unreadable files are excluded.
-    splits = split_from_manifest(load_manifest(manifest, data_root))
+    splits = split_from_manifest(load_manifest(manifest, data_root, min_nonzero_frac=p.min_nonzero_frac))
     image_counts = {name: len(rows) for name, rows in splits.items()}
     save_json(
         run_dir / "split.json",
@@ -293,17 +394,27 @@ def train_model(
     reset_peak_memory_stats(device)
 
     optimizer = torch.optim.Adam(model.parameters(), lr=p.lr)
+    scheduler = (
+        torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=p.epochs, eta_min=p.lr * 0.01) if p.cosine_lr else None
+    )
     snapshots = snapshot_epochs(p.epochs)
     frames, titles = [fixed_image], ["Input"]
+    generated_frames, generated_titles = [], []
     best_ssim, best_epoch, history = -float("inf"), 0, []
+    stopped_early = False
     start = time.perf_counter()
     for epoch in range(1, p.epochs + 1):
         epoch_start = time.perf_counter()
-        train_m = run_epoch(model, loaders["train"], model_type, device, optimizer, p.limit_batches)
-        val_m = run_epoch(model, loaders["val"], model_type, device, None, p.limit_batches, with_ssim=True)
+        learning_rate = optimizer.param_groups[0]["lr"]
+        train_m = run_epoch(model, loaders["train"], model_type, device, optimizer, p.limit_batches, ssim_weight=p.ssim_weight)
+        val_m = run_epoch(
+            model, loaders["val"], model_type, device, None, p.limit_batches, with_ssim=True, ssim_weight=p.ssim_weight
+        )
+        if scheduler is not None:
+            scheduler.step()
         seconds = time.perf_counter() - epoch_start
         history.append(
-            {"epoch": epoch}
+            {"epoch": epoch, "lr": learning_rate}
             | {f"train_{k}": v for k, v in train_m.items() if k != "n_images"}
             | {f"val_{k}": v for k, v in val_m.items() if k != "n_images"}
             | {"epoch_seconds": seconds}
@@ -328,26 +439,41 @@ def train_model(
             )
             save_json(run_dir / "best_validation_metrics.json", val_m)
 
-        if epoch in snapshots:
+        # Early stopping on validation SSIM (the checkpoint-selection metric).
+        stop = bool(p.patience) and epoch - best_epoch >= p.patience
+
+        if epoch in snapshots or stop:
             recon = reconstruct_one(model, fixed_image, device)
             ssim = ssim_2d(fixed_image[0].numpy(), recon[0].numpy())
             frames.append(recon)
             titles.append(f"Epoch {epoch}\nSSIM {ssim:.3f}")
             # Rewritten at every snapshot so an interrupted run still has a usable image.
             save_image_grid(torch.stack(frames), run_dir / "reconstructions_by_epoch.png", titles, ncols=len(frames))
+            # Same epochs, but a newly generated image instead of a reconstruction.
+            generated_frames.append(generate_snapshot_sample(model, model_type, loaders["train_eval"], device, p))
+            generated_titles.append(f"Epoch {epoch}")
+            save_image_grid(
+                torch.stack(generated_frames), run_dir / "generated_samples_by_epoch.png",
+                generated_titles, ncols=len(generated_frames),
+            )
+
+        if stop:
+            stopped_early = True
+            print(f"Early stopping: validation SSIM has not improved for {p.patience} epochs (best epoch {best_epoch}).")
+            break
     training_seconds = time.perf_counter() - start
-    plot_history(run_dir, history)
+    plot_history(run_dir, history, model_type)
 
     # Final, one-off test evaluation with the best validation checkpoint.
     checkpoint = torch.load(run_dir / "best.pt", map_location=device, weights_only=True)
     model.load_state_dict(checkpoint["model_state_dict"])
-    test_m = run_epoch(model, loaders["test"], model_type, device, None, p.limit_batches, with_ssim=True)
+    test_m = run_epoch(model, loaders["test"], model_type, device, None, p.limit_batches, with_ssim=True, ssim_weight=p.ssim_weight)
     save_json(run_dir / "test_metrics.json", test_m)
 
     if model_type == "vqvae" and train_prior:
-        generation = train_code_prior(model, loaders["train"], p, device, run_dir)
+        generation = train_code_prior(model, loaders["train_eval"], p, device, run_dir, val_loader=loaders["val"])
     elif model_type == "vae":
-        latent_prior = fit_vae_latent_prior(model, loaders["train"], device, p.limit_batches)
+        latent_prior = fit_vae_latent_prior(model, loaders["train_eval"], device, p.limit_batches)
         torch.save(latent_prior, run_dir / "latent_prior.pt")
         generation = {
             "prior": "full-covariance Gaussian fitted to training-split latents (latent_prior.pt)",
@@ -363,6 +489,8 @@ def train_model(
         "device": str(device),
         "split_image_counts": image_counts,
         "best_epoch": best_epoch,
+        "epochs_run": len(history),
+        "stopped_early": stopped_early,
         "training_wall_seconds": training_seconds,
         "total_training_plus_prior_wall_seconds": training_seconds + generation.get("prior_training_seconds", 0.0),
         "peak_cuda_memory_mb": torch.cuda.max_memory_allocated(device) / 1024**2 if device.type == "cuda" else None,
@@ -373,6 +501,8 @@ def train_model(
         "notes": [
             "Splits follow the dataset's own train/validate/test folders; case IDs were checked for overlap.",
             "SSIM measures paired input/reconstruction similarity, not the fidelity of generated images.",
+            "generated_samples_by_epoch.png uses the current fitted-Gaussian (VAE) or an independent per-position "
+            "code prior (VQ-VAE); prior_samples_by_epoch.png shows the real PixelCNN prior.",
         ],
     }
     save_json(run_dir / "run_summary.json", summary)

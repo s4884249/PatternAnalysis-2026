@@ -16,6 +16,7 @@ import csv
 import re
 import sys
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Dict, List, Sequence
 
@@ -137,25 +138,49 @@ def read_manifest(manifest_path: Path) -> List[Dict[str, str]]:
         return list(csv.DictReader(handle))
 
 
-def load_manifest(manifest_path: Path, data_root: Path, keep_shape: str = SOURCE_SHAPE_TEXT) -> List[Dict[str, str]]:
-    """Return the readable image rows (path, split, group_id); masks, error rows and
-    images whose shape is not `keep_shape` (default 256x128) are dropped."""
+def _number(text: str, default: float) -> float:
+    try:
+        return float(text)
+    except (TypeError, ValueError):
+        return default
+
+
+def load_manifest(
+    manifest_path: Path, data_root: Path, keep_shape: str = SOURCE_SHAPE_TEXT, min_nonzero_frac: float = 0.0
+) -> List[Dict[str, str]]:
+    """Return the readable image rows (path, split, group_id).
+
+    Dropped: masks, rows with a read error, images whose shape is not `keep_shape`
+    (default 256x128), blank slices (constant intensity, so there is nothing to learn from;
+    they would all normalise to an all-zero image) and, if `min_nonzero_frac` > 0, slices
+    with a smaller fraction of non-zero voxels.
+    """
     data_root = data_root.expanduser().resolve()
     rows = []
     dropped_shapes: Counter = Counter()
+    n_blank = n_sparse = 0
     for source in read_manifest(manifest_path):
         if source["kind"] != "image" or source["error"]:
             continue
         if keep_shape and source["shape"] != keep_shape:
             dropped_shapes[source["shape"] or "unknown"] += 1
             continue
+        if _number(source["std"], 1.0) <= 1e-8:
+            n_blank += 1
+            continue
+        if _number(source["nonzero_frac"], 1.0) < min_nonzero_frac:
+            n_sparse += 1
+            continue
         if not (data_root / source["path"]).is_file():
             raise FileNotFoundError(f"Manifest file missing under --data-root: {data_root / source['path']}")
         rows.append({k: source[k] for k in ("path", "split", "group_id")})
     if dropped_shapes:
-        print(f"Dropped images whose shape is not {keep_shape}: {dict(dropped_shapes)}; kept {len(rows)}")
+        print(f"Dropped images whose shape is not {keep_shape}: {dict(dropped_shapes)}")
+    if n_blank or n_sparse:
+        print(f"Dropped {n_blank} blank slices and {n_sparse} slices below nonzero_frac {min_nonzero_frac}")
+    print(f"Kept {len(rows)} images")
     if not rows:
-        raise ValueError(f"The manifest contains no readable {keep_shape} image rows")
+        raise ValueError(f"The manifest contains no usable {keep_shape} image rows")
     return rows
 
 
@@ -203,9 +228,21 @@ class NiftiSliceDataset(Dataset):
     The canvas must have the same aspect ratio as the 256x128 source slices, so the
     image is only scaled (default 128x64 = exactly 2x down) and never stretched,
     cropped or centred on a larger canvas.
+
+    cache=True decodes every slice once up front (using `threads` threads) and keeps the
+    processed tensors in RAM; the transform is deterministic, so results are identical
+    but an epoch no longer re-reads and gunzips thousands of files.
     """
 
-    def __init__(self, rows: Sequence[Dict[str, str]], data_root: Path, image_height: int = 128, image_width: int = 64):
+    def __init__(
+        self,
+        rows: Sequence[Dict[str, str]],
+        data_root: Path,
+        image_height: int = 128,
+        image_width: int = 64,
+        cache: bool = False,
+        threads: int = 1,
+    ):
         if image_height % 8 or image_width % 8:
             raise ValueError("image_height and image_width must both be divisible by 8")
         if min(image_height, image_width) < 32:
@@ -219,12 +256,13 @@ class NiftiSliceDataset(Dataset):
         self.data_root = Path(data_root).expanduser().resolve()
         self.image_height = int(image_height)
         self.image_width = int(image_width)
+        self._cache = None
+        if cache:
+            print(f"Caching {len(self.rows)} slices in memory ({max(1, threads)} threads)...")
+            with ThreadPoolExecutor(max_workers=max(1, threads)) as pool:
+                self._cache = torch.stack(list(pool.map(self._load, self.rows)))
 
-    def __len__(self) -> int:
-        return len(self.rows)
-
-    def __getitem__(self, index: int) -> Dict[str, object]:
-        row = self.rows[index]
+    def _load(self, row: Dict[str, str]) -> torch.Tensor:
         array = normalize_mri(load_array(self.data_root / row["path"]))
         if array.shape != SOURCE_SHAPE:
             raise ValueError(f"{row['path']}: expected a {SOURCE_SHAPE_TEXT} slice, got {array.shape}")
@@ -234,7 +272,15 @@ class NiftiSliceDataset(Dataset):
                 image[None], size=(self.image_height, self.image_width), mode="bilinear",
                 align_corners=False, antialias=True,
             )[0]
-        return {"image": image.contiguous(), "path": row["path"], "group_id": row["group_id"]}
+        return image.contiguous()
+
+    def __len__(self) -> int:
+        return len(self.rows)
+
+    def __getitem__(self, index: int) -> Dict[str, object]:
+        row = self.rows[index]
+        image = self._cache[index] if self._cache is not None else self._load(row)
+        return {"image": image, "path": row["path"], "group_id": row["group_id"]}
 
 
 def main() -> None:

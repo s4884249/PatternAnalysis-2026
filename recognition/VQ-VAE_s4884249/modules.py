@@ -13,28 +13,28 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
+def _norm(channels: int) -> nn.GroupNorm:
+    return nn.GroupNorm(8 if channels % 8 == 0 else 1, channels)
+
+
 class ConvEncoder(nn.Module):
-    """Three-stage convolutional encoder; spatial size is reduced by 8x.
+    """Convolutional encoder; each of `stages` stride-2 blocks halves the spatial size (8x for 3).
 
     GroupNorm (not BatchNorm) keeps behaviour independent of batch size and
     identical in train/eval mode; 8 groups when the channel count allows it.
     """
 
-    def __init__(self, in_channels: int = 1, base_channels: int = 32, latent_dim: int = 64):
+    def __init__(self, in_channels: int = 1, base_channels: int = 32, latent_dim: int = 64, stages: int = 3):
         super().__init__()
-        c1, c2, c3 = base_channels, base_channels * 2, base_channels * 4
-        self.network = nn.Sequential(
-            nn.Conv2d(in_channels, c1, kernel_size=4, stride=2, padding=1),
-            nn.GroupNorm(8 if c1 % 8 == 0 else 1, c1),
-            nn.SiLU(inplace=True),
-            nn.Conv2d(c1, c2, kernel_size=4, stride=2, padding=1),
-            nn.GroupNorm(8 if c2 % 8 == 0 else 1, c2),
-            nn.SiLU(inplace=True),
-            nn.Conv2d(c2, c3, kernel_size=4, stride=2, padding=1),
-            nn.GroupNorm(8 if c3 % 8 == 0 else 1, c3),
-            nn.SiLU(inplace=True),
-            nn.Conv2d(c3, latent_dim, kernel_size=3, stride=1, padding=1),
-        )
+        if stages not in (2, 3):
+            raise ValueError("stages must be 2 (4x downsampling) or 3 (8x downsampling)")
+        layers, previous = [], in_channels
+        for i in range(stages):
+            width = base_channels * 2**i
+            layers += [nn.Conv2d(previous, width, kernel_size=4, stride=2, padding=1), _norm(width), nn.SiLU(inplace=True)]
+            previous = width
+        layers.append(nn.Conv2d(previous, latent_dim, kernel_size=3, stride=1, padding=1))
+        self.network = nn.Sequential(*layers)
 
     def forward(self, images: torch.Tensor) -> torch.Tensor:
         return self.network(images)
@@ -43,21 +43,20 @@ class ConvEncoder(nn.Module):
 class ConvDecoder(nn.Module):
     """Decoder paired with ConvEncoder; outputs intensities in [0, 1]."""
 
-    def __init__(self, out_channels: int = 1, base_channels: int = 32, latent_dim: int = 64):
+    def __init__(self, out_channels: int = 1, base_channels: int = 32, latent_dim: int = 64, stages: int = 3):
         super().__init__()
-        c1, c2, c3 = base_channels, base_channels * 2, base_channels * 4
-        self.network = nn.Sequential(
-            nn.Conv2d(latent_dim, c3, kernel_size=3, stride=1, padding=1),
-            nn.SiLU(inplace=True),
-            nn.ConvTranspose2d(c3, c2, kernel_size=4, stride=2, padding=1),
-            nn.GroupNorm(8 if c2 % 8 == 0 else 1, c2),
-            nn.SiLU(inplace=True),
-            nn.ConvTranspose2d(c2, c1, kernel_size=4, stride=2, padding=1),
-            nn.GroupNorm(8 if c1 % 8 == 0 else 1, c1),
-            nn.SiLU(inplace=True),
-            nn.ConvTranspose2d(c1, out_channels, kernel_size=4, stride=2, padding=1),
-            nn.Sigmoid(),
-        )
+        if stages not in (2, 3):
+            raise ValueError("stages must be 2 (4x upsampling) or 3 (8x upsampling)")
+        widths = [base_channels * 2**i for i in range(stages)]
+        layers = [nn.Conv2d(latent_dim, widths[-1], kernel_size=3, stride=1, padding=1), nn.SiLU(inplace=True)]
+        for i in range(stages - 1, 0, -1):
+            layers += [
+                nn.ConvTranspose2d(widths[i], widths[i - 1], kernel_size=4, stride=2, padding=1),
+                _norm(widths[i - 1]),
+                nn.SiLU(inplace=True),
+            ]
+        layers += [nn.ConvTranspose2d(widths[0], out_channels, kernel_size=4, stride=2, padding=1), nn.Sigmoid()]
+        self.network = nn.Sequential(*layers)
 
     def forward(self, latent: torch.Tensor) -> torch.Tensor:
         return self.network(latent)
@@ -87,19 +86,21 @@ class VAE(nn.Module):
         latent_dim: int = 256,
         kl_beta: float = 0.01,
         image_size: Tuple[int, int] = (128, 64),
+        stages: int = 3,
     ):
         super().__init__()
         if kl_beta < 0:
             raise ValueError("kl_beta cannot be negative")
         height, width = int(image_size[0]), int(image_size[1])
-        if height % 8 or width % 8:
-            raise ValueError("image_size must be divisible by 8")
-        self.feature_shape = (self.feature_channels, height // 8, width // 8)
-        flat = self.feature_channels * (height // 8) * (width // 8)
-        self.encoder = ConvEncoder(base_channels=base_channels, latent_dim=self.feature_channels)
+        factor = 2**stages
+        if height % factor or width % factor:
+            raise ValueError(f"image_size must be divisible by {factor}")
+        self.feature_shape = (self.feature_channels, height // factor, width // factor)
+        flat = self.feature_channels * (height // factor) * (width // factor)
+        self.encoder = ConvEncoder(base_channels=base_channels, latent_dim=self.feature_channels, stages=stages)
         self.to_posterior = nn.Linear(flat, 2 * latent_dim)  # mean and log-variance
         self.from_latent = nn.Linear(latent_dim, flat)
-        self.decoder = ConvDecoder(base_channels=base_channels, latent_dim=self.feature_channels)
+        self.decoder = ConvDecoder(base_channels=base_channels, latent_dim=self.feature_channels, stages=stages)
         self.latent_dim = int(latent_dim)
         self.kl_beta = float(kl_beta)
         self.num_pixels = height * width
@@ -129,19 +130,83 @@ class VAE(nn.Module):
 
 
 class VectorQuantizer(nn.Module):
-    """Nearest-neighbour vector quantizer with a straight-through estimator."""
+    """Nearest-neighbour vector quantizer with a straight-through estimator.
 
-    def __init__(self, num_embeddings: int = 256, embedding_dim: int = 64, commitment_beta: float = 0.25):
+    Codebook collapse (a few codes doing all the work) is the usual VQ-VAE failure, so by
+    default the codebook is trained the way the original paper recommends and Jukebox-style
+    VQ models do:
+      * exponential-moving-average (EMA) updates instead of a gradient codebook loss;
+      * data-dependent initialisation from the first batch of encoder outputs (the tiny
+        +-1/K uniform start is far from where the encoder output actually lives);
+      * dead-code restarts: a code whose EMA usage drops below `dead_code_threshold` is
+        re-seeded with a random encoder output from the current batch.
+    ema=False restores the plain gradient-trained codebook.
+    """
+
+    def __init__(
+        self,
+        num_embeddings: int = 256,
+        embedding_dim: int = 64,
+        commitment_beta: float = 0.25,
+        ema: bool = True,
+        ema_decay: float = 0.99,
+        dead_code_threshold: float = 0.5,
+    ):
         super().__init__()
         if num_embeddings < 2:
             raise ValueError("num_embeddings must be at least 2")
         if commitment_beta < 0:
             raise ValueError("commitment_beta cannot be negative")
+        if not 0.0 < ema_decay < 1.0:
+            raise ValueError("ema_decay must be in (0, 1)")
         self.num_embeddings = int(num_embeddings)
         self.embedding_dim = int(embedding_dim)
         self.commitment_beta = float(commitment_beta)
+        self.ema = bool(ema)
+        self.ema_decay = float(ema_decay)
+        self.dead_code_threshold = float(dead_code_threshold)
         self.embedding = nn.Embedding(self.num_embeddings, self.embedding_dim)
         nn.init.uniform_(self.embedding.weight, -1.0 / self.num_embeddings, 1.0 / self.num_embeddings)
+        if self.ema:
+            self.embedding.weight.requires_grad_(False)  # updated by EMA, not by the optimiser
+            self.register_buffer("cluster_size", torch.ones(self.num_embeddings))
+            self.register_buffer("embed_avg", self.embedding.weight.detach().clone())
+            self.register_buffer("initialized", torch.zeros((), dtype=torch.long))
+        self._ready = False  # python-side cache of `initialized` (avoids a device sync per step)
+
+    @torch.no_grad()
+    def _seed_codes(self, flat: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
+        return flat[positions] + 1e-3 * torch.randn(len(positions), self.embedding_dim, device=flat.device)
+
+    @torch.no_grad()
+    def _ema_update(self, flat: torch.Tensor, indices: torch.Tensor) -> None:
+        flat = flat.detach()
+        if not self._ready:  # data-dependent start from random encoder outputs
+            self._ready = bool(self.initialized)
+        if not self._ready:
+            positions = torch.randint(0, flat.shape[0], (self.num_embeddings,), device=flat.device)
+            seeds = self._seed_codes(flat, positions)
+            self.embedding.weight.copy_(seeds)
+            self.embed_avg.copy_(seeds)
+            self.cluster_size.fill_(1.0)
+            self.initialized.fill_(1)
+            self._ready = True
+            return
+        onehot = F.one_hot(indices, self.num_embeddings).to(flat.dtype)  # [N, K]
+        decay = self.ema_decay
+        self.cluster_size.mul_(decay).add_(onehot.sum(0), alpha=1.0 - decay)
+        self.embed_avg.mul_(decay).add_(onehot.t() @ flat, alpha=1.0 - decay)
+        # Laplace smoothing keeps rarely used codes from dividing by ~0.
+        total = self.cluster_size.sum()
+        smoothed = (self.cluster_size + 1e-5) / (total + self.num_embeddings * 1e-5) * total
+        self.embedding.weight.copy_(self.embed_avg / smoothed.unsqueeze(1))
+        dead = self.cluster_size < self.dead_code_threshold
+        if bool(dead.any()):
+            positions = torch.randint(0, flat.shape[0], (int(dead.sum()),), device=flat.device)
+            seeds = self._seed_codes(flat, positions)
+            self.embedding.weight[dead] = seeds
+            self.embed_avg[dead] = seeds
+            self.cluster_size[dead] = 1.0
 
     def forward(self, z_e: torch.Tensor):
         """Return straight-through latents, codebook loss, commitment loss, code IDs, perplexity, active codes."""
@@ -152,6 +217,8 @@ class VectorQuantizer(nn.Module):
         # BCHW -> (B*H*W, D): every spatial position is quantised independently.
         vectors = z_e.permute(0, 2, 3, 1).contiguous()
         flat = vectors.view(-1, self.embedding_dim)
+        if self.ema and self.training and not self._ready and not bool(self.initialized):
+            self._ema_update(flat, None)  # initialises the codebook from this batch
         codebook = self.embedding.weight
         # Squared L2 distance to every code via |a|^2 + |b|^2 - 2ab (avoids a huge pairwise tensor).
         distances = (
@@ -160,8 +227,12 @@ class VectorQuantizer(nn.Module):
             - 2.0 * flat @ codebook.t()
         )
         indices = distances.argmin(dim=1)  # nearest code per position
+        if self.ema and self.training:
+            self._ema_update(flat, indices)
+            codebook = self.embedding.weight
         quantized = self.embedding(indices).view_as(vectors).permute(0, 3, 1, 2).contiguous()
 
+        # Under EMA the codebook has no gradient, so this is just a quantisation-error monitor.
         codebook_loss = F.mse_loss(quantized, z_e.detach())
         commitment_loss = self.commitment_beta * F.mse_loss(z_e, quantized.detach())
         # Straight-through estimator: the forward pass uses the code, the backward pass
@@ -191,15 +262,22 @@ class VQVAE(nn.Module):
         latent_dim: int = 64,
         codebook_size: int = 256,
         commitment_beta: float = 0.25,
+        stages: int = 3,
+        ema: bool = True,
+        ema_decay: float = 0.99,
+        dead_code_threshold: float = 0.5,
     ):
         super().__init__()
-        self.encoder = ConvEncoder(base_channels=base_channels, latent_dim=latent_dim)
+        self.encoder = ConvEncoder(base_channels=base_channels, latent_dim=latent_dim, stages=stages)
         self.quantizer = VectorQuantizer(
             num_embeddings=codebook_size,
             embedding_dim=latent_dim,
             commitment_beta=commitment_beta,
+            ema=ema,
+            ema_decay=ema_decay,
+            dead_code_threshold=dead_code_threshold,
         )
-        self.decoder = ConvDecoder(base_channels=base_channels, latent_dim=latent_dim)
+        self.decoder = ConvDecoder(base_channels=base_channels, latent_dim=latent_dim, stages=stages)
         self.latent_dim = latent_dim
         self.codebook_size = codebook_size
 
@@ -334,14 +412,20 @@ class CodePrior(nn.Module):
 
 
 def build_model(model_type: str, config: Dict) -> nn.Module:
-    """Instantiate a model from a params/checkpoint dictionary (see params.TrainParams)."""
+    """Instantiate a model from a params/checkpoint dictionary (see params.TrainParams).
+
+    Keys added later (downsample_stages, codebook_ema, ...) fall back to the original
+    behaviour when absent, so checkpoints written before they existed still load.
+    """
     base_channels = int(config["base_channels"])
+    stages = int(config.get("downsample_stages", 3))
     if model_type == "vae":
         return VAE(
             base_channels=base_channels,
             latent_dim=int(config["vae_latent_dim"]),
             kl_beta=float(config["kl_beta"]),
             image_size=(int(config["image_height"]), int(config["image_width"])),
+            stages=stages,
         )
     if model_type == "vqvae":
         return VQVAE(
@@ -349,6 +433,10 @@ def build_model(model_type: str, config: Dict) -> nn.Module:
             latent_dim=int(config["latent_dim"]),
             codebook_size=int(config["codebook_size"]),
             commitment_beta=float(config["commitment_beta"]),
+            stages=stages,
+            ema=bool(config.get("codebook_ema", 0)),
+            ema_decay=float(config.get("ema_decay", 0.99)),
+            dead_code_threshold=float(config.get("dead_code_threshold", 0.5)),
         )
     raise ValueError(f"Unknown model_type={model_type!r}; use 'vae' or 'vqvae'.")
 
