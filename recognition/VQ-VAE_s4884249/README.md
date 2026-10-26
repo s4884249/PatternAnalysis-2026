@@ -351,7 +351,9 @@ In addition to now dropping the `256x144` images and maintaining the original as
 The VAE was changed from a high-dimensional spatial latent representation to a compact, globally regularised latent vector, with revised KL scaling to improve the potential quality of random samples.
 
 The latent representation eas changed from a spatial latent map of `64 × 16 × 10 = 10,240` values to a single global latent vector of `256` values per image. This creates a stronger bottleneck and encourages the model to represent the overall image structure. The KL loss was adjusted to encourage latent vectors to follow a standard normal distribution, N(0,I), making random sampling more consistent with the decoder's training di stribution. Finally, the KL term was changed to be summed over latent dimensions and divided by the number of image pixels. The default kl_beta is now `0.01`, providing a tunable balance between reconstruction quality and latent regularisation.
-Results and expected impact
+
+![Reconstruction grid](images/version5_vae_reconstruction_grid.png)_VAE - Reconstruction Grid_
+![Reconstruction grid](images/version5_vq-vae_reconstruction_grid.png)_VQ-VAE - Reconstruction Grid_
 
 ![Generated Samples](images/version5_vae_generated_samples.png)
 _VAE - Generated Samples_
@@ -359,7 +361,43 @@ _VAE - Generated Samples_
 ![Generated Samples](images/version5_vq-vae_generated_samples.png)
 _VQ-VAE - Generated Samples_
 
+> Takeaway
 Overall, the generated anatomy was more coherent because the decoder receives a compact global representation rather than an independently sampled spatial latent map. The trade-off being that the MSE reconstruction loss may still produce blurry images. Additionally, with the `256x144` samples removes, there are no longer black bars on the edges.
+
+### Version 6
+
+To diagnose the problem with image generation, with the reconstruction being mostly stable, an additional graphic for image generation per epoch is produced alongside the reconstruction per epoch visual. This allows for a more visual fine tuning of the reconstruction quality and wheither further training is improving the result. Additionally, early stopping on validation cross-entropy is kept to prevent wasting GPU hours when no progress is being made.
+![Generated samples per epoch](images/version6_vae_generated_samples_by_epoch.png)_VAE - Generated Samples Per Epoch_
+![Generated samples per epoch](images/version6_vq-vae_generated_samples_by_epoch.png)_VQ-VAE - Generated Samples Per Epoch_
+![Generated samples per prior epoc](images/version6_vq-vae_prior_samples_by_epoch.png)_VQ-VAE - Generated Samples Per Prior Epoch_
+
+![Generated samples](images/version6_vq-vae_generated_samples.png)
+_VQ-VAE - Generated Samples after 300 Prior Epochs_
+
+> Takeaway
+While the VAE model was able to produce reasonable, if blury, generated samples, given sufficent epochs, the VQ-VAE became qickly distorted even after training the prior extensivly. It was hence determined that the code prior was too weak and could make codes that look right locally, but it couldn’t keep the whole anatomy (body outline, bladder, femoral heads) consistent across the grid. Furthermore, at 8× downsampling, a 16×8 grid with 256 codes means one code has to describe an 8×8 pixel patch, which caps how sharp even a perfect prior’s samples can be. Finally, the encoder and decoder were shallow having three strided convolutions with no residual blocks, and the decoder used transposed convolutions, which left checkerboard artefacts
+
+### Version 7
+
+The VQ-VAE was upgraded extensivly to be capable of fully capturing the whole anatomy:
+- The CodePrior is now a 6-layer, 256-wide causal transformer:
+  - It attends over all earlier codes and uses learned row and column position embeddings, so it knows the 2D layout.
+  - Sampling uses a key/value cache, so it stays fast even with 512 codes per image.
+- Prior training now uses AdamW with warmup and cosine decay, dropout 0.1, and weight decay on the weight matrices only. 
+- A finer code grid was implemented:
+  - A new vq_downsample_stages defaults to 2, giving a 32×16 grid of 4×4-pixel codes.
+  - The codebook is now 512.
+  - The VAE keeps its own downsample_stages, so the baseline is unchanged.
+- A new VQEncoder/VQDecoder with residual blocks and nearest-neighbour upsampling was introduced while the VAE still used the old stack.
+- For improved diagnostics and sampling:
+  - The epoch log now prints active codes and perplexity to spot codebook collapse.
+  - A new `--top-k` option was added at predict time to drop rare codes that show up as speckle.
+
+![Generated samples](images/version7_vq-vae_generated_samples.png)
+_VQ-VAE - Generated Samples after 50 Epocs and an additional 15 (stopped early after no improvement) Prior Epochs_
+
+![Generated samples with ssim weight of 0.1](images/version7_vq-vae_ssim_generated_samples.png)
+_VQ-VAE - Generated Samples after 50 Epocs and an additional 15 Prior Epochs using option `--ssim-weight 0.1`_
 
 ## Training
 

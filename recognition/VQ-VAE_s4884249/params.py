@@ -20,6 +20,7 @@ EXPERIMENTS_DIR = Path("experiments")
 # Parameters that only affect one model. They are ignored (and left out of the
 # run name) for the other model, so identical runs never get different folders.
 MODEL_SPECIFIC = {
+    "downsample_stages": "vae",
     "vae_latent_dim": "vae",
     "kl_beta": "vae",
     "latent_dim": "vqvae",
@@ -31,7 +32,11 @@ MODEL_SPECIFIC = {
     "commitment_beta": "vqvae",
     "prior_epochs": "vqvae",
     "prior_hidden": "vqvae",
+    "prior_layers": "vqvae",
+    "prior_dropout": "vqvae",
     "prior_lr": "vqvae",
+    "vq_downsample_stages": "vqvae",
+    "res_blocks": "vqvae",
 }
 
 # Already encoded in the run name prefix (seed, epochs) or irrelevant to results (device).
@@ -54,18 +59,25 @@ class TrainParams:
     # VAE: KL weight in nats-per-pixel units, equal to 2*sigma^2 of the implied Gaussian
     # decoder. 0.01 -> sigma ~ 0.07. Raise for smoother/more sampleable, lower for sharper.
     kl_beta: float = 0.01
-    # 3 = 8x downsampling (128x64 -> 16x8 latent grid). 2 = 4x (32x16 grid): the VQ-VAE keeps
-    # 4x more spatial detail (4x more codes per image) at the cost of a slower code prior.
+    # VAE only: 3 = 8x downsampling before the global latent vector, 2 = 4x.
     downsample_stages: int = 3
-    codebook_size: int = 256  # VQ-VAE: number of discrete codes
+    # VQ-VAE only: 2 = 4x downsampling (128x64 -> 32x16 grid of 4x4-pixel codes), 3 = 8x (16x8 grid of
+    # 8x8-pixel codes). 8x8 patches with only a few hundred codes cannot carry MRI texture, so
+    # reconstructions and samples are blocky/blurry; 4x keeps 4x more detail. The transformer prior handles
+    # the longer (512-code) sequences.
+    vq_downsample_stages: int = 2
+    res_blocks: int = 2  # VQ-VAE: residual blocks at the bottleneck of the encoder and decoder
+    codebook_size: int = 512  # VQ-VAE: number of discrete codes
     commitment_beta: float = 0.25  # VQ-VAE: weight pulling encoder outputs to their codes
     codebook_ema: int = 1  # VQ-VAE: 1 = EMA codebook + data init + dead-code restarts, 0 = gradient codebook
     ema_decay: float = 0.99  # VQ-VAE: EMA decay of code usage / sums
     dead_code_threshold: float = 0.5  # VQ-VAE: codes with EMA usage below this are re-seeded
     prior_epochs: int = 40  # VQ-VAE: max epochs for the code prior (stops earlier on validation CE)
     prior_patience: int = 5  # VQ-VAE: stop the prior after this many epochs without a better validation CE (0 = off)
-    prior_hidden: int = 64
-    prior_lr: float = 2e-4
+    prior_hidden: int = 256  # transformer width (must be a multiple of 32; heads = width / 32)
+    prior_layers: int = 6  # VQ-VAE: transformer blocks in the code prior
+    prior_dropout: float = 0.1  # VQ-VAE: dropout in the code prior (it overfits the training code maps otherwise)
+    prior_lr: float = 5e-4  # AdamW peak LR with warmup + cosine decay
     # Loss / schedule. ssim_weight adds weight * (1 - SSIM) to the reconstruction term (same for
     # both models). It is off by default: the baseline is plain MSE, and SSIM is the evaluation metric.
     ssim_weight: float = 0.0
@@ -86,11 +98,16 @@ class TrainParams:
             raise ValueError("kl_beta cannot be negative")
         if self.prior_epochs < 1:
             raise ValueError("prior_epochs must be >= 1 (the VQ-VAE needs a code prior)")
-        if self.downsample_stages not in (2, 3):
-            raise ValueError("downsample_stages must be 2 or 3")
-        factor = 2**self.downsample_stages
-        if self.image_height % factor or self.image_width % factor:
-            raise ValueError(f"image_height and image_width must be divisible by {factor} for downsample_stages={self.downsample_stages}")
+        for name in ("downsample_stages", "vq_downsample_stages"):
+            stages = getattr(self, name)
+            if stages not in (2, 3):
+                raise ValueError(f"{name} must be 2 or 3")
+            if self.image_height % 2**stages or self.image_width % 2**stages:
+                raise ValueError(f"image_height and image_width must be divisible by {2**stages} for {name}={stages}")
+        if self.prior_hidden % 32 or self.prior_layers < 1 or not 0.0 <= self.prior_dropout < 1.0:
+            raise ValueError("prior_hidden must be a multiple of 32, prior_layers >= 1 and prior_dropout in [0, 1)")
+        if self.res_blocks < 0:
+            raise ValueError("res_blocks cannot be negative")
         if not 0.0 < self.ema_decay < 1.0:
             raise ValueError("ema_decay must be in (0, 1)")
         if min(self.ssim_weight, self.patience, self.prior_patience, self.dead_code_threshold, self.min_nonzero_frac) < 0:
@@ -102,6 +119,7 @@ class PredictParams:
     seed: int = 42
     num_samples: int = 64  # generated images
     temperature: float = 1.0  # VQ-VAE prior sampling temperature
+    top_k: int = 0  # VQ-VAE: sample only from the k most likely codes at each position (0 = all); try 50-100
     max_reference_images: int = 5000  # training images used as the nearest-neighbour pool
     audit_test_count: int = 512  # held-out images used in the nearest-neighbour audit
     batch_size: int = 64
@@ -112,6 +130,8 @@ class PredictParams:
             raise ValueError("counts and batch_size must be positive")
         if self.temperature <= 0:
             raise ValueError("temperature must be greater than zero")
+        if self.top_k < 0:
+            raise ValueError("top_k cannot be negative")
 
 
 def add_overrides(parser, defaults) -> None:

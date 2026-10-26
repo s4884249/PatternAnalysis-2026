@@ -1,7 +1,8 @@
-"""PyTorch modules: a convolutional VAE and a VQ-VAE with a PixelCNN-style code prior.
+"""PyTorch modules: a convolutional VAE and a VQ-VAE with a transformer code prior.
 
-Both models share the same conv encoder/decoder stack so differences come from the latent space
-(VAE: one global Gaussian vector; VQ-VAE: a grid of discrete codes).
+The VAE uses the plain conv encoder/decoder stack. The VQ-VAE uses a deeper residual
+encoder/decoder (VQEncoder/VQDecoder) because its quality is bounded by how much detail each
+discrete code can carry, and a causal-transformer prior over the code grid for generation.
 Depends only on PyTorch and the standard library.
 """
 from __future__ import annotations
@@ -56,6 +57,66 @@ class ConvDecoder(nn.Module):
                 nn.SiLU(inplace=True),
             ]
         layers += [nn.ConvTranspose2d(widths[0], out_channels, kernel_size=4, stride=2, padding=1), nn.Sigmoid()]
+        self.network = nn.Sequential(*layers)
+
+    def forward(self, latent: torch.Tensor) -> torch.Tensor:
+        return self.network(latent)
+
+
+class ResBlock(nn.Module):
+    """Pre-activation residual block: (norm, SiLU, 3x3 conv) twice, with an identity skip."""
+
+    def __init__(self, channels: int):
+        super().__init__()
+        self.block = nn.Sequential(
+            _norm(channels), nn.SiLU(), nn.Conv2d(channels, channels, 3, padding=1),
+            _norm(channels), nn.SiLU(), nn.Conv2d(channels, channels, 3, padding=1),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return x + self.block(x)
+
+
+def _vq_widths(base_channels: int, stages: int) -> list:
+    return [base_channels * 2 ** (i + 1) for i in range(stages)]  # e.g. 32 -> [64, 128]
+
+
+class VQEncoder(nn.Module):
+    """Residual conv encoder for the VQ-VAE: stride-2 convs, a ResBlock at every resolution and
+    `res_blocks` more at the bottleneck. The last 1x1 conv emits the vectors that get quantised."""
+
+    def __init__(self, in_channels: int = 1, base_channels: int = 32, latent_dim: int = 64, stages: int = 2, res_blocks: int = 2):
+        super().__init__()
+        if stages not in (2, 3):
+            raise ValueError("stages must be 2 (4x downsampling) or 3 (8x downsampling)")
+        layers = [nn.Conv2d(in_channels, base_channels, 3, padding=1), ResBlock(base_channels)]
+        previous = base_channels
+        for width in _vq_widths(base_channels, stages):
+            layers += [nn.Conv2d(previous, width, kernel_size=4, stride=2, padding=1), ResBlock(width)]
+            previous = width
+        layers += [ResBlock(previous) for _ in range(res_blocks)]
+        layers += [_norm(previous), nn.SiLU(), nn.Conv2d(previous, latent_dim, kernel_size=1)]
+        self.network = nn.Sequential(*layers)
+
+    def forward(self, images: torch.Tensor) -> torch.Tensor:
+        return self.network(images)
+
+
+class VQDecoder(nn.Module):
+    """Mirror of VQEncoder. Upsamples with nearest-neighbour + 3x3 conv (no transposed-conv
+    checkerboard artefacts) and ends in a sigmoid so intensities are in [0, 1]."""
+
+    def __init__(self, out_channels: int = 1, base_channels: int = 32, latent_dim: int = 64, stages: int = 2, res_blocks: int = 2):
+        super().__init__()
+        if stages not in (2, 3):
+            raise ValueError("stages must be 2 (4x upsampling) or 3 (8x upsampling)")
+        widths = _vq_widths(base_channels, stages)
+        previous = widths[-1]
+        layers = [nn.Conv2d(latent_dim, previous, 3, padding=1)] + [ResBlock(previous) for _ in range(res_blocks)]
+        for out in list(reversed(widths[:-1])) + [base_channels]:
+            layers += [nn.Upsample(scale_factor=2, mode="nearest"), nn.Conv2d(previous, out, 3, padding=1), ResBlock(out)]
+            previous = out
+        layers += [_norm(previous), nn.SiLU(), nn.Conv2d(previous, out_channels, 3, padding=1), nn.Sigmoid()]
         self.network = nn.Sequential(*layers)
 
     def forward(self, latent: torch.Tensor) -> torch.Tensor:
@@ -252,7 +313,7 @@ class VectorQuantizer(nn.Module):
 
 
 class VQVAE(nn.Module):
-    """Convolutional VQ-VAE; samples are produced using a learned code-index prior."""
+    """Residual conv VQ-VAE; samples are produced using a learned transformer code-index prior."""
 
     model_type = "vqvae"
 
@@ -262,13 +323,14 @@ class VQVAE(nn.Module):
         latent_dim: int = 64,
         codebook_size: int = 256,
         commitment_beta: float = 0.25,
-        stages: int = 3,
+        stages: int = 2,
         ema: bool = True,
         ema_decay: float = 0.99,
         dead_code_threshold: float = 0.5,
+        res_blocks: int = 2,
     ):
         super().__init__()
-        self.encoder = ConvEncoder(base_channels=base_channels, latent_dim=latent_dim, stages=stages)
+        self.encoder = VQEncoder(base_channels=base_channels, latent_dim=latent_dim, stages=stages, res_blocks=res_blocks)
         self.quantizer = VectorQuantizer(
             num_embeddings=codebook_size,
             embedding_dim=latent_dim,
@@ -277,7 +339,7 @@ class VQVAE(nn.Module):
             ema_decay=ema_decay,
             dead_code_threshold=dead_code_threshold,
         )
-        self.decoder = ConvDecoder(base_channels=base_channels, latent_dim=latent_dim, stages=stages)
+        self.decoder = VQDecoder(base_channels=base_channels, latent_dim=latent_dim, stages=stages, res_blocks=res_blocks)
         self.latent_dim = latent_dim
         self.codebook_size = codebook_size
 
@@ -317,72 +379,103 @@ class VQVAE(nn.Module):
         }
 
 
-class MaskedConv2d(nn.Conv2d):
-    """2D convolution masked to expose only previous positions in raster order."""
+class CausalSelfAttention(nn.Module):
+    """Multi-head causal self-attention with an optional key/value cache for fast sampling."""
 
-    def __init__(self, mask_type: str, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        if mask_type not in {"A", "B"}:
-            raise ValueError("mask_type must be 'A' or 'B'")
-        self.mask_type = mask_type
-        # Keep only weights on earlier positions in raster order: rows above the centre
-        # and pixels left of the centre. Type A also hides the centre pixel itself (used
-        # on the first layer so a position cannot see its own code); type B may see it.
-        mask = torch.ones_like(self.weight)
-        kh, kw = self.kernel_size
-        cy, cx = kh // 2, kw // 2
-        mask[:, :, cy + 1 :, :] = 0
-        mask[:, :, cy, cx + 1 :] = 0
-        if mask_type == "A":
-            mask[:, :, cy, cx] = 0
-        self.register_buffer("mask", mask)
+    def __init__(self, dim: int, heads: int, dropout: float):
+        super().__init__()
+        if dim % heads:
+            raise ValueError("hidden size must be divisible by the number of heads")
+        self.heads, self.dropout = heads, float(dropout)
+        self.qkv = nn.Linear(dim, 3 * dim)
+        self.proj = nn.Linear(dim, dim)
 
-    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
-        return F.conv2d(
-            inputs,
-            self.weight * self.mask,
-            self.bias,
-            self.stride,
-            self.padding,
-            self.dilation,
-            self.groups,
-        )
+    def forward(self, x: torch.Tensor, cache: dict | None = None) -> torch.Tensor:
+        batch, length, dim = x.shape
+        q, k, v = self.qkv(x).view(batch, length, 3, self.heads, dim // self.heads).permute(2, 0, 3, 1, 4)
+        if cache is None:  # training / scoring: whole sequence at once
+            y = F.scaled_dot_product_attention(q, k, v, dropout_p=self.dropout if self.training else 0.0, is_causal=True)
+        else:  # sampling: one new query attends to every cached key
+            if "k" in cache:
+                k, v = torch.cat([cache["k"], k], dim=2), torch.cat([cache["v"], v], dim=2)
+            cache["k"], cache["v"] = k, v
+            y = F.scaled_dot_product_attention(q, k, v)
+        return self.proj(y.transpose(1, 2).reshape(batch, length, dim))
+
+
+class TransformerBlock(nn.Module):
+    def __init__(self, dim: int, heads: int, dropout: float):
+        super().__init__()
+        self.norm1, self.norm2 = nn.LayerNorm(dim), nn.LayerNorm(dim)
+        self.attention = CausalSelfAttention(dim, heads, dropout)
+        self.mlp = nn.Sequential(nn.Linear(dim, 4 * dim), nn.GELU(), nn.Linear(4 * dim, dim), nn.Dropout(dropout))
+        self.drop = nn.Dropout(dropout)
+
+    def forward(self, x: torch.Tensor, cache: dict | None = None) -> torch.Tensor:
+        x = x + self.drop(self.attention(self.norm1(x), cache))
+        return x + self.mlp(self.norm2(x))
 
 
 class CodePrior(nn.Module):
-    """Small PixelCNN-like prior over discrete VQ-VAE code indices.
+    """GPT-style causal transformer over the VQ-VAE code grid (raster order).
 
-    Logits at location (row, col) depend only on earlier code indices under
-    row-major raster order. Sampling is sequential and therefore slower than a
-    parallel decoder, but is a defensible, explicit prior for this prototype.
+    Why not a small PixelCNN: a stack of 3x3 masked convolutions only sees a local, blind-spotted
+    neighbourhood, so it cannot keep an anatomy-wide layout (body outline, bladder, femoral heads)
+    consistent across the grid and its samples are locally plausible but globally incoherent. Self-attention
+    lets every code condition on ALL earlier codes.
+
+    Position `i` predicts code `i` from codes `< i` (a learned BOS token is shifted in at the start). Positions
+    use learned row + column embeddings, so the model knows the 2D geometry. forward() returns logits
+    [B, K, H, W], the same layout as before, so the training loss code is unchanged.
     """
 
-    def __init__(self, codebook_size: int = 256, hidden_channels: int = 64):
+    def __init__(
+        self,
+        codebook_size: int = 512,
+        hidden_channels: int = 256,
+        height: int = 32,
+        width: int = 16,
+        layers: int = 6,
+        dropout: float = 0.1,
+    ):
         super().__init__()
-        self.codebook_size = int(codebook_size)
-        self.hidden_channels = int(hidden_channels)
-        self.embedding = nn.Embedding(self.codebook_size, hidden_channels)
-        self.input_conv = MaskedConv2d(
-            "A", hidden_channels, hidden_channels, kernel_size=7, padding=3
-        )
-        self.hidden_convs = nn.ModuleList(
-            [MaskedConv2d("B", hidden_channels, hidden_channels, kernel_size=3, padding=1) for _ in range(4)]
-        )
-        self.output = nn.Sequential(
-            nn.ReLU(inplace=True),
-            nn.Conv2d(hidden_channels, hidden_channels, kernel_size=1),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(hidden_channels, self.codebook_size, kernel_size=1),
-        )
+        self.codebook_size, self.hidden_channels = int(codebook_size), int(hidden_channels)
+        self.height, self.width, self.layers, self.dropout = int(height), int(width), int(layers), float(dropout)
+        dim = self.hidden_channels
+        self.token_embedding = nn.Embedding(self.codebook_size, dim)
+        self.bos = nn.Parameter(torch.zeros(1, 1, dim))
+        self.row_embedding = nn.Embedding(self.height, dim)
+        self.col_embedding = nn.Embedding(self.width, dim)
+        positions = torch.arange(self.height * self.width)
+        self.register_buffer("rows", positions // self.width, persistent=False)
+        self.register_buffer("cols", positions % self.width, persistent=False)
+        self.drop = nn.Dropout(self.dropout)
+        self.blocks = nn.ModuleList([TransformerBlock(dim, max(1, dim // 32), self.dropout) for _ in range(self.layers)])
+        self.norm = nn.LayerNorm(dim)
+        self.head = nn.Linear(dim, self.codebook_size, bias=False)
+        self.apply(self._init_weights)
+
+    @staticmethod
+    def _init_weights(module: nn.Module) -> None:
+        if isinstance(module, (nn.Linear, nn.Embedding)):
+            nn.init.normal_(module.weight, mean=0.0, std=0.02)
+            if isinstance(module, nn.Linear) and module.bias is not None:
+                nn.init.zeros_(module.bias)
+
+    def _positions(self) -> torch.Tensor:
+        return self.row_embedding(self.rows) + self.col_embedding(self.cols)  # [H*W, D]
 
     def forward(self, indices: torch.Tensor) -> torch.Tensor:
-        if indices.ndim != 3:
-            raise ValueError(f"Expected code map [B,H,W], got {tuple(indices.shape)}")
-        x = self.embedding(indices.long()).permute(0, 3, 1, 2).contiguous()
-        x = F.relu(self.input_conv(x))
-        for layer in self.hidden_convs:
-            x = x + F.relu(layer(x))  # residual connections ease optimisation of the stack
-        return self.output(x)
+        if indices.ndim != 3 or indices.shape[1:] != (self.height, self.width):
+            raise ValueError(f"Expected code map [B,{self.height},{self.width}], got {tuple(indices.shape)}")
+        batch = indices.shape[0]
+        tokens = indices.reshape(batch, -1).long()
+        x = torch.cat([self.bos.expand(batch, 1, -1), self.token_embedding(tokens[:, :-1])], dim=1) + self._positions()
+        x = self.drop(x)
+        for block in self.blocks:
+            x = block(x)
+        logits = self.head(self.norm(x))  # [B, T, K]
+        return logits.transpose(1, 2).reshape(batch, self.codebook_size, self.height, self.width)
 
     @torch.no_grad()
     def sample(
@@ -393,32 +486,53 @@ class CodePrior(nn.Module):
         device: torch.device,
         temperature: float = 1.0,
         generator: torch.Generator | None = None,
+        top_k: int = 0,
     ) -> torch.Tensor:
-        """Sample [N,H,W] code grids one position at a time (raster order).
+        """Sample [N,H,W] code grids in raster order using a key/value cache (one cheap step per code).
 
-        Each step re-runs the network on the partially filled grid; positions not yet
-        sampled are zeros, which the masks guarantee are never read.
+        top_k > 0 restricts each draw to the k most likely codes, which removes the rare
+        low-probability codes that show up as speckle/blocks in an otherwise coherent sample.
         """
         if temperature <= 0:
             raise ValueError("temperature must be greater than zero")
-        tokens = torch.zeros((num_samples, height, width), dtype=torch.long, device=device)
-        for row in range(height):
-            for col in range(width):
-                logits = self(tokens)[:, :, row, col] / temperature
-                probs = torch.softmax(logits, dim=-1)
-                sampled = torch.multinomial(probs, num_samples=1, generator=generator).squeeze(-1)
-                tokens[:, row, col] = sampled
-        return tokens
+        if (height, width) != (self.height, self.width):
+            raise ValueError(f"This prior was trained for a {self.height}x{self.width} grid, not {height}x{width}")
+        self.eval()
+        positions = self._positions()
+        total = self.height * self.width
+        tokens = torch.zeros((num_samples, total), dtype=torch.long, device=device)
+        caches = [dict() for _ in self.blocks]
+        x = self.bos.expand(num_samples, 1, -1) + positions[0]
+        for step in range(total):
+            for block, cache in zip(self.blocks, caches):
+                x = block(x, cache)
+            logits = self.head(self.norm(x[:, -1])) / temperature
+            if 0 < top_k < self.codebook_size:
+                kth = torch.topk(logits, top_k, dim=-1).values[:, -1:]
+                logits = logits.masked_fill(logits < kth, float("-inf"))
+            sampled = torch.multinomial(torch.softmax(logits, dim=-1), 1, generator=generator).squeeze(-1)
+            tokens[:, step] = sampled
+            if step + 1 < total:
+                x = (self.token_embedding(sampled) + positions[step + 1])[:, None]
+        return tokens.view(num_samples, self.height, self.width)
+
+
+def latent_stages(model_type: str, config: Dict) -> int:
+    """Number of stride-2 stages of the given model (the VQ-VAE has its own setting)."""
+    if model_type == "vqvae":
+        return int(config.get("vq_downsample_stages", 2))
+    return int(config.get("downsample_stages", 3))
 
 
 def build_model(model_type: str, config: Dict) -> nn.Module:
     """Instantiate a model from a params/checkpoint dictionary (see params.TrainParams).
 
-    Keys added later (downsample_stages, codebook_ema, ...) fall back to the original
-    behaviour when absent, so checkpoints written before they existed still load.
+    Keys added later fall back to defaults when absent. NOTE: VQ-VAE checkpoints from before the
+    residual encoder/decoder and transformer prior (vq_downsample_stages, res_blocks) have different
+    weights and must be retrained.
     """
     base_channels = int(config["base_channels"])
-    stages = int(config.get("downsample_stages", 3))
+    stages = latent_stages(model_type, config)
     if model_type == "vae":
         return VAE(
             base_channels=base_channels,
@@ -437,6 +551,7 @@ def build_model(model_type: str, config: Dict) -> nn.Module:
             ema=bool(config.get("codebook_ema", 0)),
             ema_decay=float(config.get("ema_decay", 0.99)),
             dead_code_threshold=float(config.get("dead_code_threshold", 0.5)),
+            res_blocks=int(config.get("res_blocks", 2)),
         )
     raise ValueError(f"Unknown model_type={model_type!r}; use 'vae' or 'vqvae'.")
 

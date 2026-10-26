@@ -1,7 +1,7 @@
 """Train and evaluate the VAE or the VQ-VAE on 2D HipMRI slices.
 
 The best epoch is chosen on validation SSIM and the test split is evaluated once,
-with that checkpoint. The VQ-VAE then fits a PixelCNN-style prior on training-split
+with that checkpoint. The VQ-VAE then fits a causal-transformer prior on training-split
 code maps so it can generate new images. All settings live in params.py; the run
 directory is derived from them (see params.run_dir_name).
 
@@ -11,8 +11,8 @@ Progress images (at most 10 columns, evenly spaced epochs; the same epochs for t
                                   because the model changed). VAE: decoded from a Gaussian fitted to the
                                   current training latents. VQ-VAE: decoded from codes drawn independently
                                   per grid position from the current training-code frequencies, a cheap
-                                  stand-in because the real PixelCNN prior is only trained after the VQ-VAE.
-    prior_samples_by_epoch.png    VQ-VAE only: one sample from the final PixelCNN prior per prior epoch
+                                  stand-in because the real transformer prior is only trained after the VQ-VAE.
+    prior_samples_by_epoch.png    VQ-VAE only: one sample from the transformer prior per prior epoch
 """
 
 from __future__ import annotations
@@ -229,7 +229,7 @@ def generate_snapshot_sample(model, model_type: str, loader: DataLoader, device:
     successive snapshots use identical noise and differ only because the model improved.
     VAE:    z ~ Gaussian fitted to the current training latents (as in the final latent prior).
     VQ-VAE: each grid position's code is drawn independently from that position's code
-            frequencies over the training split. This is only a stand-in for the PixelCNN prior
+            frequencies over the training split. This is only a stand-in for the transformer prior
             (which cannot exist until the VQ-VAE has finished training), so expect less
             coherent images than prior_samples_by_epoch.png.
     """
@@ -276,8 +276,30 @@ def train_code_prior(
     val_maps = collect_code_maps(model, val_loader, device, p.limit_batches) if val_loader is not None else None
     height, width = code_maps.shape[1:]
     loader = DataLoader(TensorDataset(code_maps), batch_size=p.batch_size, shuffle=True)
-    prior = CodePrior(codebook_size=p.codebook_size, hidden_channels=p.prior_hidden).to(device)
-    optimizer = torch.optim.Adam(prior.parameters(), lr=p.prior_lr)
+    prior = CodePrior(
+        codebook_size=p.codebook_size, hidden_channels=p.prior_hidden, height=int(height), width=int(width),
+        layers=p.prior_layers, dropout=p.prior_dropout,
+    ).to(device)
+    print(f"[prior] transformer over a {height}x{width} code grid ({height * width} tokens), {count_parameters(prior):,} parameters")
+    # AdamW + linear warmup + cosine decay: transformers are unstable at a full LR from step 0.
+    def decays(name: str, tensor: torch.Tensor) -> bool:  # weight matrices only, not biases/norms/embeddings
+        return tensor.ndim == 2 and "embedding" not in name
+
+    decay = [q for n, q in prior.named_parameters() if decays(n, q)]
+    no_decay = [q for n, q in prior.named_parameters() if not decays(n, q)]
+    optimizer = torch.optim.AdamW(
+        [{"params": decay, "weight_decay": 0.01}, {"params": no_decay, "weight_decay": 0.0}], lr=p.prior_lr, betas=(0.9, 0.95)
+    )
+    total_steps = p.prior_epochs * len(loader)
+    warmup_steps = max(1, min(500, total_steps // 10))
+
+    def lr_factor(step: int) -> float:
+        if step < warmup_steps:
+            return (step + 1) / warmup_steps
+        progress = (step - warmup_steps) / max(1, total_steps - warmup_steps)
+        return 0.1 + 0.9 * 0.5 * (1.0 + math.cos(math.pi * progress))
+
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_factor)
 
     snapshots = snapshot_epochs(p.prior_epochs)
     frames, titles = [], []
@@ -298,6 +320,7 @@ def train_code_prior(
             loss.backward()
             torch.nn.utils.clip_grad_norm_(prior.parameters(), max_norm=5.0)
             optimizer.step()
+            scheduler.step()
             total += float(loss.detach()) * indices.shape[0]
             count += indices.shape[0]
         row = {"epoch": epoch, "train_cross_entropy": total / count}
@@ -331,8 +354,11 @@ def train_code_prior(
     torch.save(
         {
             "state_dict": prior.state_dict(),
+            "prior_type": "transformer",
             "codebook_size": p.codebook_size,
             "hidden_channels": p.prior_hidden,
+            "layers": p.prior_layers,
+            "dropout": p.prior_dropout,
             "latent_height": int(height),
             "latent_width": int(width),
             "history": history,
@@ -341,7 +367,7 @@ def train_code_prior(
     )
     write_csv(run_dir / "prior_history.csv", history)
     summary = {
-        "prior": "PixelCNN-like autoregressive prior trained on training-split code maps",
+        "prior": "causal-transformer autoregressive prior trained on training-split code maps",
         "train_code_maps": int(code_maps.shape[0]),
         "latent_shape": [int(height), int(width)],
         "prior_parameters": count_parameters(prior),
@@ -420,9 +446,10 @@ def train_model(
             | {"epoch_seconds": seconds}
         )
         write_csv(run_dir / "history.csv", history)
+        usage = f" | codes {val_m['active_codes']:.0f}/{p.codebook_size} ppl {val_m['perplexity']:.0f}" if "perplexity" in val_m else ""
         print(
             f"epoch {epoch:03d}/{p.epochs:03d} | train loss={train_m['loss']:.5f} "
-            f"val loss={val_m['loss']:.5f} val SSIM={val_m['ssim']:.4f} | {seconds:.1f}s"
+            f"val loss={val_m['loss']:.5f} val SSIM={val_m['ssim']:.4f}{usage} | {seconds:.1f}s"
         )
 
         if val_m["ssim"] > best_ssim:  # checkpoint selection uses validation SSIM only
@@ -502,7 +529,7 @@ def train_model(
             "Splits follow the dataset's own train/validate/test folders; case IDs were checked for overlap.",
             "SSIM measures paired input/reconstruction similarity, not the fidelity of generated images.",
             "generated_samples_by_epoch.png uses the current fitted-Gaussian (VAE) or an independent per-position "
-            "code prior (VQ-VAE); prior_samples_by_epoch.png shows the real PixelCNN prior.",
+            "code prior (VQ-VAE); prior_samples_by_epoch.png shows the real transformer prior.",
         ],
     }
     save_json(run_dir / "run_summary.json", summary)

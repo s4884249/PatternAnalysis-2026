@@ -19,7 +19,7 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
 from dataset import NiftiSliceDataset
-from modules import CodePrior, build_model, count_parameters
+from modules import CodePrior, build_model, count_parameters, latent_stages
 from params import PredictParams, add_overrides, apply_overrides
 from device_utils import get_device, peak_memory_mb, reset_peak_memory_stats, sync
 from utils import read_json, save_image_grid, save_json, set_seed, ssim_2d, write_csv
@@ -82,13 +82,13 @@ def nearest_mse(query: torch.Tensor, reference: torch.Tensor, device: torch.devi
 
 def generate_samples(
     model, model_type: str, run_dir: Path, num_samples: int, device: torch.device,
-    latent_hw: Tuple[int, int], temperature: float, seed: int,
+    latent_hw: Tuple[int, int], temperature: float, seed: int, top_k: int = 0,
 ) -> Tuple[torch.Tensor, float, int | None]:
     """Draw new images; returns (samples, seconds for sampling + decoding, prior parameter count).
 
     VAE:    decode a global z drawn from the Gaussian fitted to the training latents
             (latent_prior.pt); falls back to N(0, I) if that file is missing.
-    VQ-VAE: sample code grids from the learned prior, then decode the codes.
+    VQ-VAE: sample code grids from the learned transformer prior, then decode the codes.
     """
     generator = torch.Generator(device=device).manual_seed(seed)  # reproducible, device-matched
     prior, prior_parameters = None, None
@@ -97,7 +97,13 @@ def generate_samples(
         if not prior_file.is_file():
             raise FileNotFoundError(f"VQ-VAE prior missing: {prior_file}; rerun train.py to fit the code prior")
         state = torch.load(prior_file, map_location=device, weights_only=True)
-        prior = CodePrior(codebook_size=int(state["codebook_size"]), hidden_channels=int(state["hidden_channels"])).to(device)
+        if state.get("prior_type") != "transformer":
+            raise RuntimeError(f"{prior_file} is a legacy PixelCNN prior; retrain with train.py (the VQ-VAE architecture changed too)")
+        prior = CodePrior(
+            codebook_size=int(state["codebook_size"]), hidden_channels=int(state["hidden_channels"]),
+            height=int(state["latent_height"]), width=int(state["latent_width"]),
+            layers=int(state["layers"]), dropout=float(state["dropout"]),
+        ).to(device)
         prior.load_state_dict(state["state_dict"])
         prior.eval()
         prior_parameters = count_parameters(prior)
@@ -106,7 +112,7 @@ def generate_samples(
         sync(device)
         tick = time.perf_counter()
         if prior is not None:
-            codes = prior.sample(num_samples, *latent_hw, device, temperature=temperature, generator=generator)
+            codes = prior.sample(num_samples, *latent_hw, device, temperature=temperature, generator=generator, top_k=top_k)
             samples = model.decode_indices(codes)
         else:
             eps = torch.randn((num_samples, model.latent_dim), device=device, generator=generator)
@@ -223,10 +229,10 @@ def main() -> None:
     test_nn_mse, _ = nearest_mse(audit_images, ref_images, device)
 
     # 3. New samples.
-    factor = 2 ** int(config.get("downsample_stages", 3))  # the encoder downsamples 4x or 8x
+    factor = 2 ** latent_stages(model_type, config)  # the encoder downsamples 4x or 8x
     latent_hw = (config["image_height"] // factor, config["image_width"] // factor)  # VQ-VAE code grid
     samples, sampling_seconds, prior_parameters = generate_samples(
-        model, model_type, run_dir, p.num_samples, device, latent_hw, p.temperature, p.seed
+        model, model_type, run_dir, p.num_samples, device, latent_hw, p.temperature, p.seed, p.top_k
     )
     torch.save(samples, out / "generated_samples.pt")
     save_image_grid(samples, out / "generated_samples.png", ncols=8)
@@ -300,8 +306,9 @@ def main() -> None:
             "latency_seconds_per_sample": sampling_seconds / len(samples),
             "prior_parameters": prior_parameters,
             "temperature": p.temperature if model_type == "vqvae" else None,
+            "top_k": p.top_k if model_type == "vqvae" else None,
             "method": (
-                "learned PixelCNN-style code prior" if model_type == "vqvae"
+                "learned transformer code prior" if model_type == "vqvae"
                 else "Gaussian fitted to training latents" if (run_dir / "latent_prior.pt").is_file()
                 else "global standard-normal latent vector (no latent_prior.pt)"
             ),
