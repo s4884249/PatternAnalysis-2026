@@ -38,6 +38,7 @@ from utils import save_image_grid, save_json, set_seed, ssim_2d, ssim_torch, to_
 
 SSIM_TARGET = 0.6  # assignment target, drawn on the SSIM curve
 MAX_SNAPSHOTS = 10  # upper bound on columns in the progress images
+GRAD_CLIP = 5.0  # global gradient-norm clip for the autoencoders (see run_epoch)
 
 
 def snapshot_epochs(total: int) -> set:
@@ -107,7 +108,11 @@ def run_epoch(
                     raise FloatingPointError(f"Non-finite loss at batch {index}: {loss.item()}")
                 optimizer.zero_grad(set_to_none=True)
                 loss.backward()
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)  # guards against rare gradient spikes
+                # clip_grad_norm_ returns the PRE-clip global norm: logging it (and how often it exceeds the
+                # clip value) is the gradient-hygiene evidence used by evaluate.py.
+                grad_norm = float(torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=GRAD_CLIP))
+                metrics["grad_norm"] = grad_norm
+                metrics["grad_clipped"] = float(grad_norm > GRAD_CLIP)
                 optimizer.step()
             if with_ssim:
                 real = images.clamp(0, 1)[:, 0].cpu().numpy()

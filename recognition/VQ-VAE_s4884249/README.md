@@ -19,11 +19,11 @@ The project is scoped to 2D HipMRI image generation using the provided `keras_sl
 ### Acceptance criteria
 
 - [x] Train a VQ-VAE that can reconstruct input HipMRI slices.
-- [ ] Train a VQ-VAE that can generate new samples through its learned discrete latent representation.
+- [x] Train a VQ-VAE that can generate new samples through its learned discrete latent representation.
 - [x] Evaluate generated or reconstructed images using Structural Similarity Index (SSIM), targeting a value above `0.6`
-- [ ] Compare VQ-VAE against a basic autoencoder using the same data split and comparable evaluation procedures, reporting quantitative results and representative image grids.
-- [ ] Audit generated samples against training images using nearest-neighbour comparisons and inspect latent-space interpolations to investigate memorization, mode collapse, and anatomical plausibility.
-- [ ] Record training duration, peak GPU memory usage, model parameter count, and generation runtime. Establish a practical training budget and retain a checkpoint from the best validation run.
+- [x] Compare VQ-VAE against a basic autoencoder using the same data split and comparable evaluation procedures, reporting quantitative results and representative image grids.
+- [x] Audit generated samples against training images using nearest-neighbour comparisons and inspect latent-space interpolations to investigate memorization, mode collapse, and anatomical plausibility.
+- [x] Record training duration, peak GPU memory usage, model parameter count, and generation runtime. Establish a practical training budget and retain a checkpoint from the best validation run.
 
 ## Preliminary Feasibility Evidence
 
@@ -111,22 +111,6 @@ The scans are pre-split into three distinct directories, which will be respected
 
 The sample images follow a general pattern, as shown by the mean slice vaugely resembling a scan with particular learnable features differing the various which the model will need to attemp to recreate without simply reproducing the proteted training data.
 
-```python
-# See `dataset.py`
-def normalize_mri(array: np.ndarray) -> np.ndarray:
-    """Per-slice scaling to [0, 1] after clipping to the 1st-99.5th percentile.
-
-    Clipping stops a few very bright voxels from compressing the useful range, and
-    per-slice scaling removes the arbitrary absolute intensity scale between scans.
-    """
-    low, high = np.percentile(array, [1.0, 99.5])
-    if high <= low:  # constant slice: nothing to scale
-        return np.zeros_like(array, dtype=np.float32)
-    return ((np.clip(array, low, high) - low) / (high - low)).astype(np.float32)
-```
-
-The function `normalize_mri` is used to ensure the samples are normalised to a consistent intensity and avoid a few very bright voxels from compressing the useful range.
-
 ```console
 == Files ==
 manifest rows: 25320 | readable: 25320 | unreadable: 0
@@ -170,29 +154,63 @@ per-slice mean: min 0.1012 | median 0.1622 | mean 0.1719 | max 0.2863 | std 0.04
 
 Overall there are `12660` usable images broken into an approximate 90/5/5 percent train/validate/test split that will be utilised throughout the project. Where patient identifiers or source-volume information are available, slices from the same patient or volume will be kept within a single split to reduce data leakage. The training set will be used to learn model parameters, the validation set to select configurations and checkpoints, and the test set reserved for final evaluation.
 
+### Data Loading & Preprocessing
+
 ```python
 # See `dataset.py`
-def load_manifest(manifest_path: Path, data_root: Path, keep_shape: str = SOURCE_SHAPE_TEXT) -> List[Dict[str, str]]:
-    """Return the readable image rows (path, split, group_id); masks, error rows and
-    images whose shape is not `keep_shape` (default 256x128) are dropped."""
+def normalize_mri(array: np.ndarray) -> np.ndarray:
+    """Per-slice scaling to [0, 1] after clipping to the 1st-99.5th percentile.
+
+    Clipping stops a few very bright voxels from compressing the useful range, and
+    per-slice scaling removes the arbitrary absolute intensity scale between scans.
+    """
+    low, high = np.percentile(array, [1.0, 99.5])
+    if high <= low:  # constant slice: nothing to scale
+        return np.zeros_like(array, dtype=np.float32)
+    return ((np.clip(array, low, high) - low) / (high - low)).astype(np.float32)
+```
+
+The function `normalize_mri` is used to ensure the samples are normalised to a consistent intensity and avoid a few very bright voxels from compressing the useful range.
+
+```python
+# See `dataset.py`
+def load_manifest(
+    manifest_path: Path, data_root: Path, keep_shape: str = SOURCE_SHAPE_TEXT, min_nonzero_frac: float = 0.0
+) -> List[Dict[str, str]]:
+    """Return the readable image rows (path, split, group_id).
+
+    Dropped: masks, rows with a read error, images whose shape is not `keep_shape`
+    (default 256x128), blank slices (constant intensity, so there is nothing to learn from;
+    they would all normalise to an all-zero image) and, if `min_nonzero_frac` > 0, slices
+    with a smaller fraction of non-zero voxels.
+    """
     data_root = data_root.expanduser().resolve()
     rows = []
     dropped_shapes: Counter = Counter()
+    n_blank = n_sparse = 0
     for source in read_manifest(manifest_path):
         if source["kind"] != "image" or source["error"]:
             continue
         if keep_shape and source["shape"] != keep_shape:
             dropped_shapes[source["shape"] or "unknown"] += 1
             continue
+        if _number(source["std"], 1.0) <= 1e-8:
+            n_blank += 1
+            continue
+        if _number(source["nonzero_frac"], 1.0) < min_nonzero_frac:
+            n_sparse += 1
+            continue
         if not (data_root / source["path"]).is_file():
             raise FileNotFoundError(f"Manifest file missing under --data-root: {data_root / source['path']}")
         rows.append({k: source[k] for k in ("path", "split", "group_id")})
     if dropped_shapes:
-        print(f"Dropped images whose shape is not {keep_shape}: {dict(dropped_shapes)}; kept {len(rows)}")
+        print(f"Dropped images whose shape is not {keep_shape}: {dict(dropped_shapes)}")
+    if n_blank or n_sparse:
+        print(f"Dropped {n_blank} blank slices and {n_sparse} slices below nonzero_frac {min_nonzero_frac}")
+    print(f"Kept {len(rows)} images")
     if not rows:
-        raise ValueError(f"The manifest contains no readable {keep_shape} image rows")
+        raise ValueError(f"The manifest contains no usable {keep_shape} image rows")
     return rows
-
 ```
 
 ```console
@@ -200,34 +218,6 @@ Dropped images whose shape is not 256x128: {'256x144': 60}; kept 12600
 ```
 
 To avoid dealing with sample images of to different sizes and the streching or black bars produced in an attempt of normalisation, the `0.5%` of images in the datase with a `256x144` resolution were ommited from the data dataset resulting in a final count of `12600` usable images.
-
-## File Structure
-
-```console
-recognition/VQ-VAE_s4884249/
-├── dataset.py
-├── images
-│   └── ...
-├── modules.py
-├── params.py
-├── predict.py
-├── README.md
-├── requirements.txt
-└── train.py
-```
-
-| File              | Purpose |
-| ----------------- | ------- |
-| modules.py        | Basic convolutional autoencoder, VQ-VAE, vector quantizer and masked-convolution autoregressive code prior |
-| dataset.py        | NIfTI data audit, MRI/mask classification review, intensity preprocessing and group-level data splitting |
-| train.py          | Training, validation, checkpoint selection, test metrics, codebook statistics and resource tracking |
-| predict.py        |Sample generation, reconstruction grids, latent interpolation, nearest-neighbour audits and failure-case visualisations |
-| params.py         | Model parametes |
-| utils.py          | Helper utilities |
-| README.md         | Comprehensive report and experiment documentation |
-| requirements.txt  | Python required libraries |
-
-!!TODO!! Fix above tree and purposed
 
 ## Installation Instructions
 
@@ -271,14 +261,52 @@ The project applies convolutional neural networks, representation learning, enco
 The assessment specification identifies VQ-VAE as a Hard Difficulty model for HipMRI 2D slices and cites "Neural discrete representation learning" by NeurIPS (2017). A basic autoencoder will provide the required simpler generative baseline. The comparison will examine whether discrete latent quantization provides useful improvements in image structure and diversity relative to the simpler model.
 
 The central research question is whether VQ-VAE can generate anatomically plausible and sufficiently diverse synthetic images without reproducing training examples. The final recommendation will be based on experimental evidence rather than visual quality alone.
+## 
+## File Structure
 
-## Data Augmentation
-
-!!TODO!!
-
-```python
-# !!TODO!!
+```console
+recognition/VQ-VAE_s4884249/
+├── compare.py
+├── dataset.py
+├── device_utils.py
+├── eval_analysis.py
+├── eval_metrics.py
+├── eval_plots.py
+├── evaluate.py
+├── experiments.py
+├── explore.py
+├── images
+│   └── ...
+├── manifest.csv
+├── modules.py
+├── params.py
+├── predict.py
+├── README.md
+├── requirements.txt
+├── train.py
+└── utils.py
 ```
+
+| File | Purpose |
+|---|---|
+| `modules.py` | Convolutional VAE baseline; residual VQ-VAE (residual encoder/decoder, EMA vector quantizer with dead-code restarts); causal-transformer autoregressive code prior |
+| `dataset.py` | NIfTI audit that writes `manifest.csv`, MRI/mask classification, intensity preprocessing and resizing, and case-level train/val/test splitting with a leakage check |
+| `train.py` | Training and validation, checkpoint selection, test metrics, codebook statistics, gradient-norm logging, code-prior training and resource tracking |
+| `predict.py` | Sample generation, reconstruction grids, latent interpolation, nearest-neighbour audits and failure-case visualisations for a single run |
+| `params.py` | Central training and prediction settings, command-line overrides and run-directory naming |
+| `utils.py` | Shared helpers: seeding, SSIM (NumPy and differentiable), JSON/CSV I/O and image-grid saving |
+| `device_utils.py` | Device selection (CUDA, Apple MPS, CPU), synchronisation and peak-memory helpers |
+| `manifest.csv` | Generated file inventory (split, kind, case ID, shape and intensity statistics per NIfTI file) |
+| `explore.py` | Dataset exploration from the manifest (distributions, shapes, splits, sample slices) |
+| `experiments.py` | Runs the configuration experiments and ablations |
+| `compare.py` | Compares trained runs side by side (for example, VAE vs VQ-VAE) |
+| `evaluate.py` | Evaluation entry point: loads the VAE and VQ-VAE runs, generates uncurated sample cohorts, profiles runtime and memory, then runs the analysis |
+| `eval_analysis.py` | Computes metrics, applies the pass/fail verdict criteria |
+| `eval_metrics.py` | Torch-free metrics: Fréchet distance, precision/recall/density/coverage, best-match SSIM, nearest-neighbour and data-copying tests, mode occupancy, artefact detectors |
+| `eval_plots.py` | Figure helpers for training curves, sample grids, t-SNE, memorisation audit, failure autopsy and interpolation |
+| `images/` | Figures and screenshots referenced by the README |
+| `README.md` | Comprehensive report and experiment documentation |
+| `requirements.txt` | Required Python libraries |
 
 ## Changelog
 
@@ -327,9 +355,9 @@ Regardless of the effeciancey of the model, the performance depends on the avail
 
 Apple Silicon GPU (MPS) support was added such that the models could be efficently run on the MacBook Pro being used for training. 
 
-![CPU](images/version3_speed.png)
+![CPU](images/version3_vae_speed.png)
 _CPU Version_
-![GPU](images/version4_speed.png)_GPU Version_
+![GPU](images/version4_vae_speed.png)_GPU Version_
 
 Now, experements can be run with a larger epoch count for more reliable results and to determine if the computational power's constraint on traning time was the limiting factor.
 
@@ -404,7 +432,25 @@ _VQ-VAE - Generated Samples after 50 Epocs and an additional 15 Prior Epochs usi
 ### Usage Instructions
 
 ```shell
-# !!TODO!!
+# Process NIfTI files to generate manifest.csv
+python3 dataset.py audit --data-root /path/to/keras_slices_data --output manifest.csv
+
+# Explore dataset to generate numbers & figures
+python3 explore.py --data-root /path/to/keras_slices_data --manifest manifest.csv
+
+# Train VAE and VQ-VAE models
+python3 train.py --model vae   --data-root /path/to/keras_slices_data
+python3 train.py --model vqvae --data-root /path/to/keras_slices_data --ssim-weight 0.1
+
+# Predict VAE and VQ-VAE models
+python3 predict.py --checkpoint runs/vae_seedx42-epochsx50 --top-k 50
+python3 predict.py --checkpoint runs/vqvae_seedx42-epochsx50-ssim-weightx0.1 --top-k 50
+
+# Evaluate VAE and VQ-VAE models
+python3 evaluate.py \
+    --vae-run   runs/vae_seedx42-epochsx50 \
+    --vqvae-run runs/vqvae_seedx42-epochsx50-ssim-weightx0.1 \
+    --data-root /path/to/keras_slices_data --out evaluation
 ```
 
 ### !!TODO!! Test Name
@@ -413,9 +459,60 @@ _VQ-VAE - Generated Samples after 50 Epocs and an additional 15 Prior Epochs usi
 
 !!TODO!!
 
+![Training curve](images/evaluation_training_curves.png)_Comparision of training curves of both VAE (baseline) and VQ-VAE models_
+
+![Code prior cross entopy](images/evaluation_prior_training.png)
+_VQ-VAE - Transformer code prior next-code cross-entropy_
+
+![Rexonstructions](images/evaluation_reconstructions.png)
+_Comparision of error in reconstructions between VAE (baseline) and VQ-VAE models_
+
+![Real vs Synthetic](images/evalutaion_real_vs_synthetic.png)_Comparision of real vs synthetic images generated by both VAE (baseline) and VQ-VAE models_
+
+![Nearest neighbour audit](images/evaluation_nearest_neighbour_audit.png)
+_Nearest neighbour audit of both VAE (baseline) and VQ-VAE models_
+
+In both distance to nearest training slice and best-match SSIM to training slice, both the VQ-VAE and baseline models produce outputs typical of a real sample as demonstraded by their distributions' matching that of the held-out test samples.
+
+![Closest to training](images/evaluation_closest_to_training_vae.png)
+_VAE - Comparison of generated images and their nearest training slice_
+
+![Closest to training](images/evaluation_closest_to_training_vqvae.png)
+_VAE - Comparison of generated images and their nearest training slice_
+
+![Metric comparision](images/evaluation_metric_comparison.png)
+_Metric comparision of both VAE (baseline) and VQ-VAE models_
+
+Both the baseline VAE and VQ-VAE models achive the target reconstruction SSIM score of 0.6. Furthermore, the best-match SSIM to real train slices of the VQ-VAE is in line with that of the hold-out, with the VAE baseline performing slightly worse than waht would be expected of real samples. Finally, the VQ-VAE model outperforms the baseline model in all of: Frechet distance, precision, recall, distance and coverage, however, in all but recall the VQ-VAE model does not produce outputs typical of true samples.
+
+![VQ-VAE flawed generations](images/evaluation_failure_autopsy_vqvae.png)
+_VAE - autopsy of flawed generations
+
+![VAE flawed generations](images/evaluation_failure_autopsy_vae.png)
+_VQ-VAE - autopsy of flawed generations_
+
+![Embedding](images/evaluation_embedding.png)
+_t-SNE of Inception-v3 pool features for both VAE (baseline) and VQ-VAE models_
+
+![VQ-VAE latent interpolation](images/version7_vq-vae_latent_interpolation.png)
+_VAE - Latent interpolation (synthetic sample left, training sample right)_
+
+![VQ-VAE latent interpolation](images/version7_vq-vae_latent_interpolation.png)
+_VQ-VAE - Latent interpolation (synthetic sample left, training sample right)_
+
+![Resource profile](images/evaluation_resource_profile.png)
+_Resource profile of both VAE (baseline) and VQ-VAE models_
+
 ## Generated Images
 
-!!TODO!!
+![VAE generated samples](images/evalutaion_samples_vae.png)
+_VAE - Generated samples_
+
+![VQ-VAE generated samples](images/evalutaion_samples_vqvae.png)
+_VQ-VAE - Generated samples_
+
+![VQ-VAE generated samples](images/evalutaion_samples_vqvae.png)
+_VQ-VAE - Generated samples_
 
 ## Training Loss
 
