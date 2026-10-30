@@ -1,4 +1,6 @@
-# Image Generation: Synthetic Medical Cohorts and Privacy using VQ-VAE
+# Image Generation: Synthetic Medical Cohorts and Privacy using VQ-VAE and Transformer Prior
+
+Student ID: `s4884249`
 
 ## Project Description
 
@@ -114,7 +116,9 @@ Actual training duration will depend on dataset size, image resolution, model co
 ## Dataset
 
 The project will use the provided HipMRI 2D slices from keras_slices_data, available through the COMP3710 project environment. Images will be loaded, checked for corrupted or inconsistent dimensions, and normalised to a consistent intensity range suitable for the selected reconstruction loss.
-![Sample Slices](images/explore_sample_slices.png)_Figure 3: Sample slices for each train/validate/test directories_
+
+![Sample Slices](images/explore_sample_slices.png)
+_Figure 3: Sample slices for each train/validate/test directories_
 
 The figure presents representative MRI slices from the training, validation and testing datasets. All three sets contain recognisable HipMRI anatomy, including variations in tissue boundaries, internal structures and the position and appearance of high-intensity regions.
 
@@ -123,7 +127,9 @@ The purpose of this comparison is to identify obvious distribution differences b
 The dataset is divided at the patient level rather than randomly assigning individual slices. This is particularly important for medical imaging because multiple slices from the same patient are likely to contain highly correlated anatomical information. Randomly distributing these slices across different splits would allow a model to encounter nearly identical patient-specific anatomy during training and testing, artificially increasing its reported performance.
 
 The dataset audit confirms that there are no patients shared between the training, validation and testing sets. The figures provide a visual check of their contents, although a larger statistical comparison would be required to establish that the distributions are fully equivalent.
-![Pixel Statistics](images/explore_pixel_statistics.png)_Figure 4: Pixel statistics across all samples_
+
+![Pixel Statistics](images/explore_pixel_statistics.png)
+_Figure 4: Pixel statistics across all samples_
 
 The figure provides three complementary views of the preprocessed dataset: the mean image, the per-pixel standard deviation and the overall pixel-intensity histogram.
 
@@ -271,7 +277,7 @@ _Figure 8: Installation instructions (MacOS)_
 
 ## Model Architecture and Difficulty
 
-Model: `Vector-Quantised Variational Autoencoder (VQ-VAE)`
+Model: `Vector-Quantised Variational Autoencoder (VQ-VAE) + Transformer Prior`
 Difficulty band: `Hard Difficulty`
 
 VQ-VAE uses an encoder to map an image into a lower-dimensional latent representation. The representation is quantized by assigning latent vectors to entries in a learned discrete codebook. A decoder then reconstructs the image from the quantized representation. The training objective combines reconstruction loss with terms that train the codebook and encourage the encoder to use its discrete representations effectively.
@@ -286,9 +292,7 @@ The primary advantage of a Vector-Quantised Variational Autoencoder is its abili
 
 During encoding, the input image is compressed into a lower-dimensional representation. Each resulting latent vector is then replaced by the nearest entry in a learned codebook. The decoder reconstructs the image using these quantised representations.
 
-This provides several advantages for medical image generation.
-
-Firstly, the discrete codebook encourages the model to learn a collection of recurring visual patterns. Instead of representing every image using entirely independent continuous values, the model learns reusable representations of local anatomical structures. This can make recurring tissue patterns easier to represent consistently.
+This provides several advantages for medical image generation. Firstly, the discrete codebook encourages the model to learn a collection of recurring visual patterns. Instead of representing every image using entirely independent continuous values, the model learns reusable representations of local anatomical structures. This can make recurring tissue patterns easier to represent consistently.
 
 Secondly, the discrete representation provides a suitable foundation for learning spatial relationships between latent codes. An additional autoregressive model can learn the probability of each code given the codes that precede it. This allows the model to generate new latent representations by learning how different local structures should be arranged together.
 
@@ -438,7 +442,9 @@ Apple Silicon GPU (MPS) support was added such that the models could be efficent
 
 ![CPU](images/version3_vae_speed.png)
 _Figure 14: CPU Version_
-![GPU](images/version4_vae_speed.png)_Figure 15: GPU Version_
+
+![GPU](images/version4_vae_speed.png)
+_Figure 15: GPU Version_
 
 Both configurations use the same model architecture containing 551,105 parameters. Their training losses and validation SSIM values are also comparable across the five measured epochs.
 
@@ -465,12 +471,15 @@ The VAE was changed from a high-dimensional spatial latent representation to a c
 
 The latent representation eas changed from a spatial latent map of `64 × 16 × 10 = 10,240` values to a single global latent vector of `256` values per image. This creates a stronger bottleneck and encourages the model to represent the overall image structure. The KL loss was adjusted to encourage latent vectors to follow a standard normal distribution, N(0,I), making random sampling more consistent with the decoder's training di stribution. Finally, the KL term was changed to be summed over latent dimensions and divided by the number of image pixels. The default kl_beta is now `0.01`, providing a tunable balance between reconstruction quality and latent regularisation.
 
-![Reconstruction grid](images/version5_vae_reconstruction_grid.png)_Figure 18: VAE - Reconstruction Grid_
+![Reconstruction grid](images/version5_vae_reconstruction_grid.png)
+_Figure 18: VAE - Reconstruction Grid_
 
 The reconstruction examples show that the revised VAE successfully preserves the main spatial arrangement of the input MRI slices. In particular, the prominent central high-intensity regions remain recognisable, and the surrounding tissue patterns are broadly maintained. However, finer boundaries and smaller structures are noticeably smoother than in the original images.
 
 This demonstrates the effect of the stronger latent bottleneck. The model retains information that is useful for reconstructing the overall image while discarding some lower-level detail. The reconstruction grid is important because it verifies that the revised latent representation has not prevented the VAE from reconstructing meaningful anatomical structures, even though the latent space has been substantially compressed
-![Reconstruction grid](images/version5_vq-vae_reconstruction_grid.png)_Figure 19: VQ-VAE - Reconstruction Grid_
+
+![Reconstruction grid](images/version5_vq-vae_reconstruction_grid.png)
+_Figure 19: VQ-VAE - Reconstruction Grid_
 
 The corresponding VQ-VAE reconstruction grid demonstrates its ability to reconstruct the same general anatomical structures using discrete latent representations. The reconstructed images retain the prominent high-intensity regions and broader surrounding tissue structures. This demonstrates that quantisation has not prevented the model from retaining the most visually significant information from the input.
 
@@ -502,9 +511,15 @@ Monitoring generated samples throughout training provides additional information
 Comparing generated outputs across epochs helps identify whether additional training improves anatomical coherence, introduces artefacts or produces diminishing returns. The inclusion of both reconstruction and generation monitoring therefore provides a more complete basis for selecting model checkpoints.
 
 This version also introduces early stopping based on validation cross-entropy. This is useful for preventing unnecessary training when the model's ability to predict unseen latent codes no longer improves. Unlike training loss, validation cross-entropy provides an indication of whether the learned code distribution generalises beyond the training examples.
-![Generated samples per epoch](images/version6_vae_generated_samples_by_epoch.png)_Figure 22: VAE - Generated Samples Per Epoch_
-![Generated samples per epoch](images/version6_vq-vae_generated_samples_by_epoch.png)_Figure 23: VQ-VAE - Generated Samples Per Epoch_
-![Generated samples per prior epoc](images/version6_vq-vae_prior_samples_by_epoch.png)_Figure 24: VQ-VAE - Generated Samples Per Prior Epoch_
+
+![Generated samples per epoch](images/version6_vae_generated_samples_by_epoch.png)
+_Figure 22: VAE - Generated Samples Per Epoch_
+
+![Generated samples per epoch](images/version6_vq-vae_generated_samples_by_epoch.png)
+_Figure 23: VQ-VAE - Generated Samples Per Epoch_
+
+![Generated samples per prior epoc](images/version6_vq-vae_prior_samples_by_epoch.png)
+_aFigure 24: VQ-VAE - Generated Samples Per Prior Epoch_
 
 ![Generated samples](images/version6_vq-vae_generated_samples.png)
 _Figure 25: VQ-VAE - Generated Samples after 300 Prior Epochs_
@@ -605,7 +620,8 @@ However, reconstruction quality alone does not establish generative quality. The
 
 Overall, the results demonstrate that the VQ-VAE is the stronger model for this experiment, but neither reconstruction quality nor feature-distribution similarity alone is sufficient to establish that its synthetic images are appropriate for clinical or research use.
 
-![Training curve](images/evaluation_training_curves.png)_Figure 29: Comparision of training curves of both VAE (baseline) and VQ-VAE models_
+![Training curve](images/evaluation_training_curves.png)
+_Figure 29: Comparision of training curves of both VAE (baseline) and VQ-VAE models_
 
 The training curves provide an overview of model convergence, reconstruction quality, gradient stability, codebook utilisation and learning-rate progression.
 
@@ -630,7 +646,7 @@ Figure 30 demonstrates the training and validation performance of the autoregres
 
 The training cross-entropy progressively decreases, indicating that the transformer is becoming more effective at predicting the next latent code given the previously generated codes. The validation cross-entropy initially decreases but begins to plateau around epoch 10, with little improvement during subsequent epochs. The best validation checkpoint is therefore identified at approximately epoch 10.
 
-The dotted reference line represents the cross-entropy obtained by uniformly predicting across all 512 available codebook entries. Since a uniform prediction assigns equal probability to every possible code, its cross-entropy is approximately \(\ln(512)\), or 6.24 nats per code.
+The dotted reference line represents the cross-entropy obtained by uniformly predicting across all 512 available codebook entries. Since a uniform prediction assigns equal probability to every possible code, its cross-entropy is approximately `ln(512)`, or 6.24 nats per code.
 
 Both training and validation losses improve substantially beyond this reference, demonstrating that the transformer has learned meaningful statistical relationships between latent codes.
 
@@ -638,7 +654,7 @@ The increasing separation between training and validation cross-entropy later in
 
 This graph is particularly important because the transformer determines how discrete local representations are arranged into complete synthetic images. A codebook may contain realistic anatomical features, but the prior must learn their spatial dependencies to generate coherent images.
 
-![Rexonstructions](images/evaluation_reconstructions.png)
+![Reconstructions](images/evaluation_reconstructions.png)
 _Figure 31 Comparision of error in reconstructions between VAE (baseline) and VQ-VAE models_
 
 Figure 31 presents test images, their corresponding reconstructions and visual error representations for both models. The VAE baseline generally preserves the larger anatomical structures but produces relatively blurred reconstructions. Fine tissue boundaries and smaller local details are less clearly represented. The VQ-VAE reconstructions retain more of the original structural detail and produce lower reconstruction errors. This is consistent with the higher held-out SSIM and lower reconstruction MSE observed in the final comparison.
@@ -647,7 +663,8 @@ The error representations are useful because they identify where reconstruction 
 
 The figure therefore provides qualitative evidence supporting the quantitative reconstruction comparison. It also demonstrates why examining spatial error patterns is important in medical imaging: an error affecting a small but anatomically significant boundary may be more consequential than an equivalent error distributed across background pixels.
 
-![Real vs Synthetic](images/evalutaion_real_vs_synthetic.png)_Figure 32: Comparision of real vs synthetic images generated by both VAE (baseline) and VQ-VAE models_
+![Real vs Synthetic](images/evalutaion_real_vs_synthetic.png)
+_Figure 32: Comparision of real vs synthetic images generated by both VAE (baseline) and VQ-VAE models_
 
 Figure 32 compares real training images, held-out real images and synthetic images generated by both models. The real images demonstrate the variation in anatomical appearance across the dataset. The VAE-generated samples reproduce some of the overall intensity patterns but exhibit noticeable blurring and loss of fine structural detail.
 
@@ -792,17 +809,12 @@ The perplexity values provide an additional measure of codebook utilisation. Per
 
 Taken together, the results provide encouraging evidence that the VQ-VAE does not exhibit significant codebook collapse. Almost every code is used across the evaluated datasets. This is particularly important for the project's generative objective because the codebook provides the discrete representations from which synthetic images are constructed. Effective utilisation allows the model to represent a wider variety of recurring image features, while accurate reproduction of code frequencies helps the prior generate latent representations that are statistically consistent with those learned by the encoder.
 
-## Further Experements
-
-!TODO!
-
 ## Final Model Architecture
 
 ![Final model architecture](images/final_architecture.png)
-_Final model architecture_
+_Figure 44: Final model architecture_
 
-
-### ## Final Model Architectures
+### Final Model Architectures
 
 ### VAE (Baseline): 3,553,889 Trainable Parameters
 
@@ -952,15 +964,90 @@ The experimental results justify the additional complexity of the VQ-VAE for thi
 ## Final Generated Images
 
 ![VAE generated samples](images/evalutaion_samples_vae.png)
-_VAE - Generated samples_
+_Figure 45: VAE - Generated samples_
 
 ![VQ-VAE generated samples](images/evalutaion_samples_vqvae.png)
-_VQ-VAE - Generated samples_
-
-![VQ-VAE generated samples](images/evalutaion_samples_vqvae.png)
-_VQ-VAE - Generated samples_
+_Figure 46: VQ-VAE - Generated samples_
 
 ## Final Discussion and Limitations
+
+This project investigated whether a Vector-Quantised Variational Autoencoder (VQ-VAE) could generate realistic and diverse synthetic HipMRI images while reducing the likelihood of reproducing individual training images. A Variational Autoencoder (VAE) was implemented as the baseline to evaluate whether the additional representational capacity and autoregressive sampling mechanism of the VQ-VAE provided meaningful improvements.
+
+Overall, the experimental results demonstrate that the VQ-VAE outperforms the VAE baseline in reconstruction quality and in several measures of generated-image fidelity and distribution similarity. However, these improvements come at the cost of increased model complexity, training time and generation latency.
+
+### Generated Image Quality and Distribution Similarity
+
+The generated-sample grids demonstrate that the VAE produces recognisable MRI-like images but frequently exhibits blurred anatomical structures and inconsistent tissue boundaries. The VQ-VAE produces considerably more coherent images with sharper structures and a closer visual resemblance to real scans.
+
+The quantitative distribution metrics support these observations. The VQ-VAE achieves a Fréchet distance of approximately 75.14, compared with approximately 226 for the VAE baseline and 51.59 for the held-out real-data reference. Since lower Fréchet distance indicates greater similarity between feature distributions, the results demonstrate that the VQ-VAE generates samples substantially closer to the real dataset than the baseline.
+
+The precision, recall, density and coverage measurements provide additional information about the generated distributions. Precision indicates whether generated samples occupy regions associated with real images, whereas recall assesses how much of the real-data distribution is represented by the generated samples. Density and coverage provide further information about how generated samples populate the real-data feature space.
+
+The VQ-VAE improves considerably over the baseline, particularly in its ability to represent the real-data distribution. Its relatively strong recall indicates that it captures a broader range of real-data characteristics. However, its remaining differences in precision, density and coverage demonstrate that the generated distribution is not yet equivalent to that of genuine MRI images.
+
+This distinction is important because a generative model could produce several visually convincing images while repeatedly generating only a limited subset of the underlying anatomical variation. Evaluating the distribution as a whole provides a stronger indication of representativeness than selecting a few favourable examples.
+
+### Diversity and Memorisation
+
+The nearest-neighbour evaluation investigates whether generated images are unusually similar to individual training examples. This is particularly important for medical imaging because a model that reproduces patient scans may create privacy risks when synthetic images are distributed outside their original clinical environment.
+
+The VQ-VAE achieves a mean best-match SSIM to training images of approximately 0.341, compared with approximately 0.343 for the held-out real reference. This similarity suggests that generated images are not, on average, substantially closer to training examples than genuine unseen images are. The nearest-neighbour examples also demonstrate differences between generated samples and their closest training images. These results provide encouraging evidence against obvious image-level copying.
+
+However, similarity measurements cannot establish that patient-specific information has not been memorised. A generative model may retain identifying characteristics without producing an almost identical copy of an original image. Consequently, the nearest-neighbour analysis should be interpreted as an initial memorisation assessment rather than a formal privacy guarantee.
+
+The use of multiple random seeds and uncurated generated-sample grids also provides evidence that the models can produce variation between samples. Nevertheless, a more comprehensive diversity evaluation would be required to establish that the complete range of real anatomical variation is represented.
+
+### Computational Efficiency and Practical Trade-offs
+
+The experimental results demonstrate that the VQ-VAE's improvements require considerably greater computational resources. The VAE contains approximately 3.55 million parameters, compared with approximately 7.02 million for the VQ-VAE. Training the VQ-VAE requires approximately 175 minutes, compared with approximately 19.3 minutes for the VAE. Generation latency also differs substantially. The VAE generates a sample in approximately 0.19 ms, whereas the VQ-VAE requires approximately 49.9 ms. This difference is primarily attributable to the autoregressive transformer, which must predict a sequence of discrete latent codes before the decoder can reconstruct the final image.
+
+This trade-off is important when considering practical deployment. Although the VQ-VAE provides considerably better image quality, its sequential sampling process makes it less computationally efficient than the baseline. For relatively small synthetic cohorts, this additional cost may be acceptable. However, generating very large datasets would benefit from further optimisation of the prior and sampling procedure.
+
+The resource measurements also demonstrate that model parameter count does not directly determine peak accelerator memory consumption. The two models exhibit different memory requirements during training and generation because their architectures and execution procedures differ. Overall, the VQ-VAE represents a more computationally demanding but substantially more capable generative architecture for the selected task.
+
+## Limitations
+
+Despite the improvements demonstrated by the VQ-VAE, several limitations restrict the conclusions that can be drawn from the experiments.
+
+### Dataset Size and Generalisation
+
+The original dataset contains 38 patients, with 31 assigned to training, four to validation and three to testing. Although the dataset contains thousands of individual slices, the number of independent patients is relatively small. Patient-level splitting prevents slices from the same patient appearing in multiple partitions, reducing the risk of data leakage. However, the small number of held-out patients limits the strength of conclusions about generalisation to previously unseen individuals. Furthermore, the dataset is specific to HipMRI and does not establish that the model will generalise to other anatomical regions, MRI acquisition protocols or clinical institutions. Additional data from independent patients and imaging centres would be necessary to establish whether the learned representation generalises beyond the original dataset.
+
+### Two-Dimensional Image Generation
+
+The project generates individual 2D MRI slices rather than complete 3D medical volumes. Although the model can learn the anatomical appearance of individual slices, it does not explicitly enforce continuity between adjacent slices. Consequently, independently generated images may contain structures that would not remain anatomically consistent when arranged into a three-dimensional volume. This limits the applicability of the generated images to tasks requiring volumetric anatomical consistency. A future implementation could investigate a three-dimensional generative architecture or introduce explicit relationships between adjacent slices.
+
+### Preprocessing and Loss Functions
+
+Per-slice percentile normalisation improves training stability by reducing the influence of extreme intensities and differences in absolute signal magnitude. However, this approach removes information about absolute MRI intensity. Consequently, the generated images cannot be assumed to preserve the original quantitative signal characteristics of real scans. The reconstruction objective also introduces limitations. Although MSE and SSIM encourage accurate reconstruction and structural preservation, neither metric directly evaluates physiological correctness. The frequency-domain analysis demonstrates that even when reconstruction and SSIM results are strong, differences in image sharpness and high-frequency information can remain. Additional perceptual, anatomical and domain-specific evaluation methods would therefore be beneficial.
+
+### Limitations of Evaluation Metrics
+
+The evaluation uses several complementary metrics, but each has limitations. SSIM primarily measures structural similarity and does not establish whether anatomical structures are physiologically valid. Fréchet distance and precision/recall/density/coverage provide information about feature distributions, but their conclusions depend on the feature representation used. In particular, Inception-v3 features are not specifically designed for MRI anatomy. Their similarity measurements may capture general visual characteristics without adequately representing clinically significant anatomical differences. The frequency-domain and Laplacian measurements provide additional information about image sharpness and artefacts but cannot independently establish anatomical correctness. In particular, checkerboard energy is not a definitive detector of generated-image defects, since natural high-frequency structures can also contribute to the measured energy.
+
+The current evaluation should therefore be understood as a combination of quantitative image-quality measurements and visual inspection rather than a complete assessment of clinical image validity.
+
+### Privacy and Memorisation
+
+The nearest-neighbour analysis provides encouraging evidence that the VQ-VAE does not simply reproduce its training images. However, it does not constitute a formal privacy assessment. The models have not been established as differentially private, and no formal membership-inference or patient re-identification evaluation has been demonstrated. Consequently, the generated images cannot be assumed to be anonymous or safe for unrestricted distribution solely because their nearest training images exhibit measurable differences. Further privacy testing would be required before considering the generated dataset suitable for sharing outside the original research environment.
+
+### Anatomical Validity and Clinical Utility
+
+Although the VQ-VAE produces more realistic-looking images than the baseline, the generated samples still exhibit occasional artefacts and differences from real MRI images. The project does not include formal expert clinical validation or demonstrate that the generated images preserve all anatomically significant structures. Furthermore, the experiments do not establish whether synthetic images improve the performance of downstream medical imaging tasks. A visually convincing synthetic image may still contain misleading structures that negatively affect a model trained using it.
+
+A future evaluation should investigate downstream utility by training a segmentation or other medical imaging model using real images alone and comparing it against a model trained using real images supplemented with synthetic samples. Both models should then be evaluated exclusively on held-out real patients. This would establish whether synthetic images provide practical benefits rather than merely improving visual similarity metrics.
+
+## Conclusion
+
+The experimental results demonstrate that the VQ-VAE is the stronger of the two evaluated generative architectures for the selected HipMRI dataset. Its discrete latent representation, finer spatial encoding, residual encoder-decoder and autoregressive transformer provide a more effective mechanism for learning and generating anatomical image structures than the compact continuous latent representation of the VAE baseline.
+
+The VQ-VAE achieves substantially higher reconstruction SSIM, improved feature-distribution similarity and greater preservation of high-frequency image information. The frequency-domain and sharpness analysis provides further evidence that its generated images are less blurred and more closely resemble real MRI images.
+
+However, these improvements come at the cost of increased computational requirements, and the generated distribution still differs from the real-data reference. The nearest-neighbour analysis provides encouraging evidence against obvious image-level memorisation, but does not establish formal patient privacy. Similarly, the quantitative metrics and visual results do not establish clinical validity or downstream research utility.
+
+Therefore, the VQ-VAE successfully demonstrates the potential of discrete latent representations for synthetic HipMRI generation and provides a stronger solution than the implemented VAE baseline. Nevertheless, additional patient-level evaluation, anatomical validation, privacy testing and downstream utility experiments would be required before the generated images could be recommended for use in real medical imaging research.
+
+The final engineering recommendation is to retain the VQ-VAE as the preferred experimental architecture while treating its generated images as research prototypes rather than clinically validated or privacy-guaranteed synthetic medical data.
 
 ## AI Disclosure
 
@@ -983,7 +1070,7 @@ All code was manually reviewed ensuring that there were no obvious bugs or inacc
 
 ## References
 
-1. The University of Queensland. (2026). COMP3710 Pattern Recognition and Analysis: Report specification (v2.3), Appendix: HipMRI Study for prostate cancer radiotherapy dataset and Appendix B (Nifti loading code).
-2. van den Oord, A., Kalchbrenner, N., Vinyals, O., Espeholt, L., Graves, A., & Kavukcuoglu, K. (2016). Conditional image generation with PixelCNN decoders. Advances in Neural Information Processing Systems, 29.
+1. PyTorch Team. (2026). PyTorch Documentation (Version 2.14). https://docs.pytorch.org/docs/2.14/index.html
+2. The University of Queensland. (2026). COMP3710 Pattern Recognition and Analysis: Report specification (v2.3), Appendix: HipMRI Study for prostate cancer radiotherapy dataset and Appendix B (Nifti loading code).
 3. van den Oord, A., Vinyals, O., & Kavukcuoglu, K. (2017). Neural discrete representation learning. Advances in Neural Information Processing Systems, 30.
 4. Wang, Z., Bovik, A. C., Sheikh, H. R., & Simoncelli, E. P. (2004). Image Quality Assessment: From Error Visibility to Structural Similarity. IEEE TIP.
