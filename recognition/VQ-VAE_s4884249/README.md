@@ -1,4 +1,4 @@
-# Generating Synthetic Hip MRI Slices with a VQ-VAE and Transformer Prior [Hard Difficulty]
+# Generating Synthetic Hip MRI Slices with a VQ-VAE and Autoregressive Prior [Hard Difficulty]
 
 Student ID: `s4884249`
 
@@ -1038,6 +1038,31 @@ Although the VQ-VAE produces more realistic-looking images than the baseline, th
 A future evaluation should investigate downstream utility by training a segmentation or other medical imaging model using real images alone and comparing it against a model trained using real images supplemented with synthetic samples. Both models should then be evaluated exclusively on held-out real patients. This would establish whether synthetic images provide practical benefits rather than merely improving visual similarity metrics.
 
 ## Conclusion
+
+### Key Results
+
+| Metric | VAE (Baseline) | VQ-VAE |
+|---|---:|---:|
+| Reconstruction SSIM | 0.713 | **0.950** |
+| Fréchet Distance (lower is better) | ~226 | **75.14** |
+| Best-match SSIM to Training Images | 0.293 | 0.341 |
+| Trainable Parameters | 3,553,889 | 7,016,961 |
+| Training Time | 19.3 min | 175 min |
+| Generation Latency | 0.19 ms | 49.9 ms |
+
+| VQ-VAE Metric | Training | Held-out Test | Prior-Generated |
+|---|---:|---:|---:|
+| Active Codebook Entries | 512/512 | 509/512 | 511/512 |
+| Codebook Perplexity | 389 | 369 | 384 |
+
+**Key Findings**
+- Both models exceed the target reconstruction SSIM of 0.6.
+- VQ-VAE achieves substantially better reconstruction quality and feature-distribution similarity.
+- VQ-VAE demonstrates effective codebook utilisation without evidence of severe codebook collapse.
+- Nearest-neighbour results show no obvious systematic reproduction of training images.
+- VQ-VAE requires approximately 9.1× longer training and 263× higher generation latency than the VAE.
+
+### Final Words
 
 The experimental results demonstrate that the VQ-VAE is the stronger of the two evaluated generative architectures for the selected HipMRI dataset. Its discrete latent representation, finer spatial encoding, residual encoder-decoder and autoregressive transformer provide a more effective mechanism for learning and generating anatomical image structures than the compact continuous latent representation of the VAE baseline.
 
