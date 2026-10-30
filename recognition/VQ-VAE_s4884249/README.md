@@ -1,4 +1,4 @@
-# Image Generation: Synthetic Medical Cohorts and Privacy using VQ-VAE and Transformer Prior
+# Generating Synthetic Hip MRI Slices with a VQ-VAE and Transformer Prior [Hard Difficulty]
 
 Student ID: `s4884249`
 
