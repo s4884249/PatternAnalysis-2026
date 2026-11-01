@@ -286,17 +286,112 @@ The cases expose different failure mechanisms: high-frequency artefacts, disconn
 
 ### Computational profile
 
-| Measurement | VAE baseline | VQ-VAE |
+Computational profiling was performed on an Apple M5 Pro (64 GiB unified memory) using PyTorch 2.14.1 and the MPS backend, with float32 inputs of size 128 × 64. Measurements use warmed-up runs and report median latency; generation was measured over five runs. The models were randomly initialised, so these results characterise architectural resource requirements rather than the performance of trained checkpoints.
+
+| Metric | VAE | VQ-VAE |
 |---|---:|---:|
-| Trainable parameters | `3,553,889` | `7,016,961` |
-| Training time | `19.3 min` | `175 min` |
-| Peak accelerator memory (training) | `67.8 MB` | `38.7 MB` |
-| Peak accelerator memory (generation) | `26 MB` | `45.1 MB` |
-| Generation latency | `0.19 ms/sample` | `49.9 ms/sample` |
+| Trainable parameters | 3.55M | 7.02M |
+| Resident weights | 13.6 MiB | 27.0 MiB |
+| Peak reconstruction memory (batch 64) | 40.7 MiB | 226.1 MiB |
+| Peak training-step memory (batch 64) | 229.1 MiB | 2,285.5 MiB |
+| Training-step latency (batch 64) | 23.8 ms | 172.7 ms |
+| Generation latency (batch 1) | 0.44 ms | 636.9 ms |
+| Generation throughput (batch 64) | 15,780.6 images/s | 32.0 images/s |
 
-The VQ-VAE takes approximately `9.1×` longer to train and has approximately `263×` higher generation latency. It uses fewer measured accelerator-memory bytes during training but more during generation; memory use therefore does not scale directly with parameter count. The autoregressive prior's 512 sequential prediction steps are the main generation bottleneck.
+The VAE was substantially more computationally efficient, requiring approximately one-tenth of the VQ-VAE's peak training-step memory and completing a batch-64 training step around 7.3 times faster. The VQ-VAE's autoregressive transformer prior is the main computational bottleneck: sampling 512 latent codes takes approximately 663 ms per image, compared with 0.99 ms for the decoder alone. Prior training is particularly memory-intensive, reaching approximately 13 GiB at batch size 64.
 
-## 7. Discussion and Recommendation
+Both models completed the measured operations, but these benchmarks do not establish training convergence or numerical stability. The higher VQ-VAE training latency and memory requirements make it more sensitive to batch size and available unified memory. Its autoregressive generation also limits practical sampling throughput. These costs should be considered when selecting batch sizes, planning experiments, and generating synthetic datasets. MPS memory measurements are approximate, include allocator caching where reported by the driver, and may vary with system memory pressure and thermal conditions.
+
+## 7. Hyperparameter Experiments and Further Actions
+
+### Experimental protocol
+
+Three one-factor-at-a-time hyperparameter sweeps were conducted using `experiments.py`. Each configuration was trained for 30 epochs across three random seeds (42, 43, 44), with results reported as mean ± standard deviation. Unless otherwise specified, the VQ-VAE configuration used the default codebook size of 512, an SSIM loss weight of 0, and two downsampling stages. The SSIM loss weight of 0 was used rather than the current model's 0.1 for a closer comparison with the baseline model.
+
+Reconstruction quality was assessed using test SSIM and mean squared error (MSE). Generated-sample quality was assessed using best-match SSIM, pixel-PCA Fréchet distance (FD), precision, recall, coverage, close-match rate, and sharpness ratio. Codebook utilization and prior validation cross-entropy (CE) were recorded where applicable.
+
+### 1. Codebook size
+
+| Codebook size | Test SSIM ↑ | Test MSE ↓ | FD ↓ | Precision ↑ | Recall ↑ | Best-match SSIM ↑ | Close-match rate ↓ | Sharpness ratio | Perplexity |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 64 | 0.8882 ± 0.0013 | 0.001485 ± 0.000017 | 1.098 ± 0.340 | 0.9674 ± 0.012 | 0.8711 ± 0.043 | 0.3465 ± 0.015 | 0.1484 ± 0.032 | 0.528 ± 0.032 | 51.63 ± 0.99 |
+| 128 | 0.9013 ± 0.0031 | 0.001302 ± 0.000031 | 1.011 ± 0.170 | 0.9648 ± 0.035 | **0.9023 ± 0.014** | **0.3599 ± 0.010** | **0.1341 ± 0.037** | 0.5735 ± 0.038 | 101.3 ± 3.3 |
+| 256 | 0.9140 ± 0.0013 | 0.001144 ± 0.000020 | 1.062 ± 0.220 | 0.9714 ± 0.036 | 0.8620 ± 0.066 | 0.3551 ± 0.013 | 0.1419 ± 0.063 | 0.5733 ± 0.023 | 192.4 ± 0.73 |
+| **512 (defailt)** | 0.9245 ± 0.0034 | 0.001016 ± 0.000043 | 0.8993 ± 0.060 | 0.9701 ± 0.025 | 0.8789 ± 0.031 | 0.3540 ± 0.0072 | 0.2096 ± 0.044 | 0.6035 ± 0.063 | 360.1 ± 5.5 |
+| 1024 | **0.9323 ± 0.0033** | **0.0009107 ± 0.000039** | **0.8777 ± 0.013** | **0.9753 ± 0.0081** | 0.8581 ± 0.046 | 0.3519 ± 0.0014 | 0.1445 ± 0.028 | **0.655 ± 0.030** | 721.2 ± 6.2 |
+
+*Arrows indicate the preferred direction. Values are mean ± standard deviation across three seeds.*
+
+Increasing the codebook size improved reconstruction quality monotonically. Increasing it from 512 to 1024 raised test SSIM from 0.9245 to 0.9323 and reduced MSE from 0.001016 to 0.0009107. FD also decreased from 0.8993 to 0.8777, while precision and sharpness ratio increased.
+
+However, these gains did not extend to every criterion. Recall and best-match SSIM were highest at 128, and the close-match rate at 512 was substantially higher than at the other tested sizes. The 1024-entry codebook therefore offers a promising reconstruction and sample-quality trade-off, but its larger latent vocabulary does not by itself establish better privacy or anatomical validity. The differences in FD and close-match rate should also be interpreted in light of variation across seeds.
+
+### 2. SSIM loss weight
+
+| Model | SSIM weight | Test SSIM ↑ | Test MSE ↓ | FD ↓ | Precision ↑ | Recall ↑ | Best-match SSIM ↑ | Close-match rate ↓ | Sharpness ratio |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| VAE | 0 | 0.6970 ± 0.0008 | **0.004430 ± 0.000033** | **0.5176 ± 0.046** | 0.7214 ± 0.013 | 0.8477 ± 0.027 | 0.2895 ± 0.0028 | 0.0599 ± 0.016 | 0.2864 ± 0.0073 |
+| VAE | 0.05 | 0.7403 ± 0.0006 | 0.004643 ± 0.000014 | 0.5267 ± 0.052 | 0.6680 ± 0.020 | 0.8698 ± 0.009 | 0.2846 ± 0.0020 | **0.0326 ± 0.011** | 0.3524 ± 0.0060 |
+| VAE | 0.1 | 0.7444 ± 0.0008 | 0.004847 ± 0.000012 | 0.5474 ± 0.070 | 0.6641 ± 0.0068 | 0.8750 ± 0.0068 | 0.2832 ± 0.0011 | 0.0391 ± 0.010 | 0.3727 ± 0.0090 |
+| VAE | 0.25 | 0.7463 ± 0.0007 | 0.005097 ± 0.000026 | 0.5647 ± 0.071 | 0.6510 ± 0.032 | 0.8607 ± 0.015 | 0.2829 ± 0.0030 | 0.0404 ± 0.023 | **0.3895 ± 0.0032** |
+| VAE | 0.5 | 0.7462 ± 0.0008 | 0.005285 ± 0.000028 | 0.5991 ± 0.089 | 0.6458 ± 0.034 | **0.8828 ± 0.0068** | 0.2832 ± 0.0035 | 0.0391 ± 0.014 | 0.3852 ± 0.013 |
+| VQ-VAE | **0 (default)** | 0.9245 ± 0.0034 | 0.001016 ± 0.000043 | **0.8993 ± 0.060** | 0.9701 ± 0.025 | 0.8789 ± 0.031 | 0.3540 ± 0.0072 | 0.2083 ± 0.043 | 0.6035 ± 0.063 |
+| VQ-VAE | **0.05** | 0.9438 ± 0.0013 | **0.0009531 ± 0.000022** | 0.9916 ± 0.240 | 0.9479 ± 0.018 | 0.8867 ± 0.017 | 0.3528 ± 0.0063 | **0.0898 ± 0.047** | 0.7522 ± 0.043 |
+| VQ-VAE | **0.1 (current)** | 0.9458 ± 0.0010 | 0.0009610 ± 0.000020 | 1.082 ± 0.390 | 0.9518 ± 0.0045 | 0.8945 ± 0.050 | **0.3583 ± 0.0054** | 0.0977 ± 0.038 | **0.7633 ± 0.034** |
+| VQ-VAE | 0.25 | 0.9477 ± 0.0005 | 0.0009792 ± 0.000011 | 0.8924 ± 0.210 | **0.9635 ± 0.018** | **0.8984 ± 0.048** | 0.3510 ± 0.017 | 0.1263 ± 0.033 | 0.7490 ± 0.040 |
+| VQ-VAE | 0.5 | **0.9481 ± 0.0005** | 0.001010 ± 0.000010 | 1.044 ± 0.260 | 0.9753 ± 0.011 | 0.8828 ± 0.027 | 0.3395 ± 0.018 | 0.1055 ± 0.014 | 0.7180 ± 0.033 |
+
+*Values are mean ± standard deviation. Bold identifies selected reference values or the best observed value for a particular metric within each model; it does not imply statistical significance.*
+
+For the VAE baseline, increasing the SSIM weight improved test SSIM but increased MSE and FD. A weight of 0.05 produced the lowest close-match rate, while larger weights generally increased the sharpness ratio. This illustrates that better reconstruction structure does not necessarily imply better generated-sample distribution quality.
+
+For the VQ-VAE, a weight of 0.05 is a promising alternative to the current weight of 0.1. It achieved a test SSIM of 0.9438, a slightly lower MSE of 0.0009531, and a lower close-match rate of 0.0898, compared with 0.9458, 0.0009610, and 0.0977 at 0.1. Its recall was also slightly lower, while FD was lower than at 0.1 but remained variable across seeds.
+
+A weight of 0.25 produced the highest mean recall in this sweep, whereas 0.5 produced the highest mean test SSIM and precision. Neither was uniformly better: best-match SSIM declined as the weight increased beyond 0.1, and the close-match rate increased at 0.25 and 0.5. The modest reconstruction gains at higher weights therefore do not justify selecting them on SSIM alone.
+
+### 3. Number of downsampling stages
+
+| Downsampling stages | Parameters | Test SSIM ↑ | Test MSE ↓ | FD ↓ | Precision ↑ | Recall ↑ | Best-match SSIM ↑ | Close-match rate ↓ | Sharpness ratio | Training time (s) |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| **2 (default)** | 2.003M | **0.9245 ± 0.0034** | **0.001016 ± 0.000043** | **0.8993 ± 0.060** | **0.9701 ± 0.025** | **0.8789 ± 0.031** | **0.3540 ± 0.0072** | 0.2083 ± 0.043 | **0.6035 ± 0.063** | 4773 ± 340 |
+| 3 | 7.924M | 0.7754 ± 0.0076 | 0.003348 ± 0.000100 | 1.067 ± 0.150 | 0.9570 ± 0.017 | 0.8346 ± 0.012 | 0.3538 ± 0.0055 | **0.1549 ± 0.047** | 0.4142 ± 0.027 | 5199 ± 290 |
+
+Two downsampling stages substantially outperformed three in reconstruction quality, FD, precision, recall, and sharpness ratio, while requiring fewer parameters and less training time in this sweep. Three stages reduced the close-match rate, but the result was accompanied by substantially worse reconstruction and distribution metrics. The similar best-match SSIM values do not offset these differences.
+
+The two-stage architecture should therefore remain the default. A deeper encoder-decoder is not justified by these results, although the lower close-match rate at three stages warrants further investigation rather than being interpreted as conclusive evidence of improved privacy.
+
+### 4. Interpretation and limitations
+
+The sweeps reveal trade-offs between reconstruction fidelity, sample diversity, distributional similarity, and potential memorisation. Although all configurations exceeded the reconstruction SSIM threshold, none provided uniformly improved results that would justify an imediate change to the model configuration.
+
+The held-out real-data reference values were FD = 3.7, precision = 0.875, recall = 0.0703, coverage = 0.492, density = 0.777, best-match SSIM = 0.335, and pairwise SSIM = 0.164. The generated-sample FD values were lower than the real-data reference under the same evaluation procedure, but this should not be interpreted as proof that synthetic samples are more realistic. These metrics use pixel-PCA features and small cohorts, so their absolute values are not equivalent to published FID results. In particular, the very different precision and recall values indicate that the generated and real sample distributions behave differently under the evaluator.
+
+Close-match rate is a useful screening measure, not a privacy guarantee. Best-match SSIM also measures similarity rather than clinical correctness: a high value can indicate faithful anatomical structure, but it can also indicate excessive similarity to a training example. Conversely, a low value does not establish anatomical plausibility or safety. None of the reported metrics establishes concrete diagnostic utility, preservation of pathology, or absence of patient information.
+
+Differences should be interpreted in relation to the reported seed variability. Three repeats provide an initial estimate of stability, not a definitive statistical comparison. Generation metrics and the selected checkpoint should be re-evaluated on a larger sample before drawing conclusions about memorisation, diversity, or clinical suitability.
+
+### 5. Future actionable experiment recommendations beyond the scope of this report
+
+The current configuration (`codebook_size=512`, `ssim_weight=0.1`, and two downsampling stages) provides a useful reference for controlled follow-up experiments. The sweeps suggest the following changes for further investigation:
+
+1. **Increase the codebook size to 1024.** This setting improved mean test SSIM, MSE, FD, precision, and sharpness ratio in the codebook sweep. The trade-off is reduced recall relative to 128 and no clear improvement in best-match SSIM. Evaluate whether the larger codebook improves anatomical detail without increasing training-image similarity or reducing sample diversity.
+
+2. **Reduce the SSIM weight to 0.05.** Relative to 0.1, this setting slightly improved MSE and reduced the mean close-match rate from 0.0977 to 0.0898, with a small decrease in test SSIM. It is a promising candidate for reducing excessive similarity, but the close-match result has substantial seed variability and does not demonstrate privacy.
+
+3. **Retain two downsampling stages.** Three stages increased parameter count from approximately 2.0M to 7.9M and degraded reconstruction and several generation metrics. Further architecture changes should focus on preserving spatial detail and avoiding artefacts rather than simply increasing depth.
+
+4. **Evaluate the combined configuration.** The next experiment should combine `codebook_size=1024`, `ssim_weight=0.05`, and `downsample_stages=2`. This configuration combines promising results from the individual sweeps, but the joint effect is unknown because the hyperparameters were varied separately. Train it with the same data split, epoch budget, and seeds as the reference model. Compare the combined model against the current configuration and the best individual alternatives before accepting the change.
+
+5. **Strengthen memorisation and privacy evaluation.** Run the full nearest-neighbour audit using `evaluate.py` on uncurated generated samples. Examine the closest training matches individually, compare similarity distributions rather than only a single threshold, and investigate whether particular patients or anatomical regions are disproportionately represented. Where feasible, add patient-level privacy tests and confirm that improvements persist across seeds.
+
+6. **Prioritise anatomical plausibility and downstream safety.** Inspect uncurated sample grids, latent-space interpolations, and automatically flagged failures. Review tissue boundaries, spatial continuity, implausible structures, and artefacts with appropriate domain expertise. Where segmentation labels are available, assess anatomical consistency against them. Before using synthetic images for downstream training, compare downstream performance using real-only, synthetic-only, and mixed training data, and evaluate performance on held-out real patients, including relevant subgroup and pathology-specific analyses where the dataset supports them.
+
+7. **Validate reproducibility and distributional metrics.** Increase the number of repeats and generated samples, report uncertainty, and retain the best checkpoint selected using validation data. Keep the test set reserved for final evaluation. Reassess FD, precision, recall, coverage, sharpness, close-match rate, and prior validation CE together rather than optimising a single metric.
+
+These experiments would test whether the modest improvements observed in individual sweeps transfer to a combined model and whether they improve the properties that matter for safe synthetic medical imaging. A configuration should only be recommended for downstream training after demonstrating adequate anatomical plausibility, useful sample diversity, acceptable similarity to training data, and performance on held-out real data. The present results motivate these investigations but do not establish that any configuration is clinically safe or privacy-preserving.
+
+
+## 8. Discussion and Recommendation
 
 The VQ-VAE is the stronger model on this dataset: it improves reconstruction SSIM from `0.713` to `0.950`, reduces Fréchet distance from approximately `226` to `75.14`, and uses almost the entire codebook. Its feature distribution is closer to real HipMRI than the VAE's, but it remains different from the held-out real reference and still produces occasional artefacts.
 
@@ -312,7 +407,7 @@ The findings have important limits:
 
 **Recommendation:** retain the VQ-VAE as the preferred experimental architecture for further research, but treat its outputs as research prototypes only. Do not regard them as clinically validated or privacy-guaranteed data. Before downstream use or sharing, obtain expert anatomical review, test patient-level generalisation and privacy risk, and evaluate utility on a separate task using held-out real patients. Optimising the autoregressive prior should be a priority if generation throughput matters.
 
-## 8. Artificial Intelligence Usage Disclosure
+## 9. Artificial Intelligence Usage Disclosure
 
 ### Tools used
 
@@ -331,7 +426,7 @@ Claude (Anthropic) was used throughout this project to assist in the generation 
 
 All code was manually reviewed ensuring that there were no obvious bugs or inaccuracies while ensuring strict version control so, that if any issues were later found to be introduced by the foreign code, changes can be rolled back to the last stable version. The models were then verified based on visual sample reconstruction and generations to ensure that the outputed samples match what is suggested by the numerical results. Finally, solutions to issues proposed to the AI model where tested to determing wheither the casue of the issue was identified or whether the changes made did not address the original issue. The original figures were refenced to ensure that all results matched the model output rather than being haloosinated by the LLM.
 
-## References
+## 10. References
 
 1. The University of Queensland. (2026). *COMP3710/COMP7710 Pattern Recognition: Version 2.5 Final Assessment Specification*.
 2. van den Oord, A., Vinyals, O., & Kavukcuoglu, K. (2017). Neural discrete representation learning. *Advances in Neural Information Processing Systems*, 30.
