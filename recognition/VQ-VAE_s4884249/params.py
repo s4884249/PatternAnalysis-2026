@@ -45,6 +45,12 @@ NAME_EXCLUDE = {"seed", "epochs", "device"}
 
 @dataclass(frozen=True)
 class TrainParams:
+    """Frozen dataclass with every training hyper-parameter and data setting; the defaults are the
+    documented final configuration.
+
+    Fields that only matter for one model are listed in MODEL_SPECIFIC. Each field doubles as a command-
+    line flag (see add_overrides).
+    """
     seed: int = 42
     epochs: int = 50
     batch_size: int = 64
@@ -92,6 +98,9 @@ class TrainParams:
     device: str = "auto"  # auto, cpu, mps, cuda or cuda:0
 
     def __post_init__(self):
+        """Validate ranges and cross-field constraints (e.g. the image size must be divisible by the
+        downsampling factor); raises ValueError on the first problem.
+        """
         if min(self.epochs, self.batch_size) < 1 or self.workers < 0:
             raise ValueError("epochs and batch_size must be >= 1 and workers >= 0")
         if self.kl_beta < 0:
@@ -102,6 +111,8 @@ class TrainParams:
             stages = getattr(self, name)
             if stages not in (2, 3):
                 raise ValueError(f"{name} must be 2 or 3")
+            # Both sides must survive `stages` halvings, otherwise the decoder output would not
+            # match the input size.
             if self.image_height % 2**stages or self.image_width % 2**stages:
                 raise ValueError(f"image_height and image_width must be divisible by {2**stages} for {name}={stages}")
         if self.prior_hidden % 32 or self.prior_layers < 1 or not 0.0 <= self.prior_dropout < 1.0:
@@ -116,6 +127,9 @@ class TrainParams:
 
 @dataclass(frozen=True)
 class PredictParams:
+    """Frozen dataclass with the settings of predict.py: how many images to sample, sampling temperature /
+    top-k, and the sizes of the nearest-neighbour audit.
+    """
     seed: int = 42
     num_samples: int = 64  # generated images
     temperature: float = 1.0  # VQ-VAE prior sampling temperature
@@ -126,6 +140,9 @@ class PredictParams:
     device: str = "auto"
 
     def __post_init__(self):
+        """Validate that counts are positive and the sampling settings are in range; raises ValueError
+        otherwise.
+        """
         if min(self.num_samples, self.max_reference_images, self.audit_test_count, self.batch_size) < 1:
             raise ValueError("counts and batch_size must be positive")
         if self.temperature <= 0:
@@ -139,6 +156,8 @@ def add_overrides(parser, defaults) -> None:
     for field in fields(defaults):
         parser.add_argument(
             "--" + field.name.replace("_", "-"),
+            # argparse converts the text to the default's own type (int, float or str), so
+            # `--epochs 5` arrives as an int.
             type=type(getattr(defaults, field.name)),
             default=None,
             help=f"default: {getattr(defaults, field.name)}",
@@ -147,6 +166,7 @@ def add_overrides(parser, defaults) -> None:
 
 def apply_overrides(defaults, args):
     """Return a copy of `defaults` with every flag the user actually passed."""
+    # None means 'flag not passed', so an explicit value such as 0 still counts as an override.
     given = {f.name: getattr(args, f.name) for f in fields(defaults) if getattr(args, f.name) is not None}
     return replace(defaults, **given)
 
@@ -157,10 +177,14 @@ def changed_suffix(params: TrainParams, model: str | None = None) -> str:
     parts = []
     for field in fields(params):
         owner = MODEL_SPECIFIC.get(field.name)
+        # Skip fields already in the folder-name prefix, and fields owned by the other model, so
+        # e.g. a VAE-only change never renames a VQ-VAE run.
         if field.name in NAME_EXCLUDE or (model and owner and owner != model):
             continue
         value = getattr(params, field.name)
         if value != getattr(defaults, field.name):
+            # :g keeps numbers short (0.10 becomes 0.1); replacing '/' keeps string values safe
+            # to use in a folder name.
             text = f"{value:g}" if isinstance(value, (int, float)) else str(value).replace("/", "_")
             parts.append(f"-{field.name.replace('_', '-')}x{text}")
     return "".join(parts)

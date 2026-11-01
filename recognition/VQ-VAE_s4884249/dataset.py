@@ -27,7 +27,11 @@ from torch.utils.data import Dataset
 
 MASK_TOKENS = ("mask", "label", "seg", "annotation", "groundtruth", "ground_truth", "segmentation")
 # Images are case_XXX_week_W_slice_S and masks seg_XXX_week_W_slice_S.
+# (?i) = case-insensitive. Matches image names (case_040_week_5_slice_18) and mask names (seg_040_...); the
+# named groups give case / week / slice, and `[_-]?` tolerates a missing separator after 'case' or 'seg'.
 FILENAME_PATTERN = re.compile(r"(?i)^(?:case|seg)[_-]?(?P<case>\d+)_week_(?P<week>\d+)_slice_(?P<slice>\d+)$")
+# Used with fullmatch on the top-level folder name, so only exact keras_slices[_seg]_{train,validate,test}
+# folders match; the capture group is the split word.
 SPLIT_PATTERN = re.compile(r"keras_slices_(?:seg_)?(train|validate|test)")
 MANIFEST_FIELDS = ["path", "split", "kind", "group_id", "shape", "min", "max", "mean", "std", "nonzero_frac", "error"]
 
@@ -39,6 +43,8 @@ SOURCE_SHAPE_TEXT = "x".join(map(str, SOURCE_SHAPE))
 
 
 def nifti_stem(path: Path) -> str:
+    """File name without its NIfTI extension (.nii.gz or .nii, case-insensitive); falls back to Path.stem.
+    """
     name = path.name
     for extension in (".nii.gz", ".nii"):
         if name.lower().endswith(extension):
@@ -48,6 +54,7 @@ def nifti_stem(path: Path) -> str:
 
 def infer_kind(relative: Path) -> str:
     """Masks live in keras_slices_seg_* folders; anything mask-like is excluded, the rest is an image."""
+    # Normalise so tokens such as 'ground-truth' and 'ground_truth' are both detected.
     text = relative.as_posix().lower().replace("-", "_")
     return "mask" if any(token in text for token in MASK_TOKENS) else "image"
 
@@ -76,6 +83,8 @@ def load_array(path: Path) -> np.ndarray:
         import nibabel as nib
     except ImportError as exc:
         raise RuntimeError("NIfTI I/O requires nibabel (pip install nibabel).") from exc
+    # get_fdata applies the NIfTI scaling slope/intercept; squeeze removes singleton dimensions (e.g.
+    # 256x128x1 becomes 256x128).
     array = np.squeeze(np.asarray(nib.load(str(path)).get_fdata(dtype=np.float32), dtype=np.float32))
     if array.ndim != 2:
         raise ValueError(f"Expected a 2D image (or singleton extra dimensions), got shape={array.shape}")
@@ -93,6 +102,7 @@ def audit_directory(data_root: Path, output_csv: Path) -> Dict[str, int]:
     data_root = data_root.expanduser().resolve()
     if not data_root.is_dir():
         raise FileNotFoundError(f"Dataset directory does not exist: {data_root}")
+    # Sorted so the manifest rows come out in a deterministic order.
     paths = sorted(p for p in data_root.rglob("*") if p.is_file() and p.name.lower().endswith((".nii", ".nii.gz")))
     if not paths:
         raise FileNotFoundError(f"No .nii or .nii.gz files found under {data_root}")
@@ -114,7 +124,11 @@ def audit_directory(data_root: Path, output_csv: Path) -> Dict[str, int]:
             try:
                 array = load_array(path)
                 row.update(
+                    # Per-file intensity statistics. load_manifest later uses std
+                    # (blank-slice test) and nonzero_frac (sparse-slice test).
                     shape="x".join(map(str, array.shape)),
+                    # 7 significant digits are enough to round-trip float32 values
+                    # through the CSV.
                     min=f"{array.min():.7g}",
                     max=f"{array.max():.7g}",
                     mean=f"{array.mean():.7g}",
@@ -134,11 +148,15 @@ def read_manifest(manifest_path: Path) -> List[Dict[str, str]]:
     manifest_path = manifest_path.expanduser().resolve()
     if not manifest_path.is_file():
         raise FileNotFoundError(f"Manifest not found: {manifest_path} (run `python3 dataset.py audit` first)")
+    # utf-8-sig silently strips the byte-order mark that Excel adds when a CSV is re-saved.
     with manifest_path.open(newline="", encoding="utf-8-sig") as handle:
         return list(csv.DictReader(handle))
 
 
 def _number(text: str, default: float) -> float:
+    """Parse `text` as a float, returning `default` when it is empty or not numeric (manifest cells can be
+    blank).
+    """
     try:
         return float(text)
     except (TypeError, ValueError):
@@ -165,6 +183,8 @@ def load_manifest(
         if keep_shape and source["shape"] != keep_shape:
             dropped_shapes[source["shape"] or "unknown"] += 1
             continue
+        # std ~ 0 means a constant (blank) slice; the default of 1.0 keeps rows whose std is
+        # missing.
         if _number(source["std"], 1.0) <= 1e-8:
             n_blank += 1
             continue
@@ -173,6 +193,7 @@ def load_manifest(
             continue
         if not (data_root / source["path"]).is_file():
             raise FileNotFoundError(f"Manifest file missing under --data-root: {data_root / source['path']}")
+        # Keep only the columns the rest of the pipeline needs.
         rows.append({k: source[k] for k in ("path", "split", "group_id")})
     if dropped_shapes:
         print(f"Dropped images whose shape is not {keep_shape}: {dict(dropped_shapes)}")
@@ -199,10 +220,14 @@ def split_from_manifest(rows: Sequence[Dict[str, str]]) -> Dict[str, List[Dict[s
     if empty:
         raise ValueError(f"No image rows for split(s) {empty}; check --data-root and the manifest.")
 
+    # Set of case IDs per split; used to prove that no patient appears in two splits.
     cases = {name: {row["group_id"] for row in values} for name, values in splits.items()}
     overlaps = {
+        # Pairwise set intersection of case IDs; any non-empty result means patient leakage between
+        # splits.
         f"{a}/{b}": sorted(cases[a] & cases[b]) for a, b in (("train", "val"), ("train", "test"), ("val", "test"))
     }
+    # Keep only the pairs that actually overlap.
     overlaps = {pair: ids for pair, ids in overlaps.items() if ids}
     if overlaps:
         detail = "; ".join(f"{pair}: {ids[:10]}" for pair, ids in overlaps.items())
@@ -243,10 +268,18 @@ class NiftiSliceDataset(Dataset):
         cache: bool = False,
         threads: int = 1,
     ):
+        """Validate the canvas size and, if `cache` is set, pre-load every slice into RAM.
+
+        rows: manifest rows (path, split, group_id); data_root: folder the row paths are relative
+        to; image_height / image_width: target size, which must keep the 2:1 aspect ratio of the
+        source slices; threads: number of loader threads used while caching.
+        """
         if image_height % 8 or image_width % 8:
             raise ValueError("image_height and image_width must both be divisible by 8")
         if min(image_height, image_width) < 32:
             raise ValueError("Image canvas must be at least 32 pixels on each side")
+        # Cross-multiplied aspect-ratio test (height/width == 256/128) that avoids floating-point
+        # division.
         if image_height * SOURCE_SHAPE[1] != image_width * SOURCE_SHAPE[0]:
             raise ValueError(
                 f"{image_height}x{image_width} does not keep the {SOURCE_SHAPE_TEXT} aspect ratio "
@@ -259,31 +292,47 @@ class NiftiSliceDataset(Dataset):
         self._cache = None
         if cache:
             print(f"Caching {len(self.rows)} slices in memory ({max(1, threads)} threads)...")
+            # pool.map keeps the input order, so cache[i] belongs to rows[i]. Threads help
+            # because reading and decompressing files is I/O-bound.
             with ThreadPoolExecutor(max_workers=max(1, threads)) as pool:
                 self._cache = torch.stack(list(pool.map(self._load, self.rows)))
 
     def _load(self, row: Dict[str, str]) -> torch.Tensor:
+        """Read, normalise and (if needed) resize one slice to a float32 tensor [1, H, W]; raises if
+        the raw slice is not 256x128.
+        """
         array = normalize_mri(load_array(self.data_root / row["path"]))
         if array.shape != SOURCE_SHAPE:
             raise ValueError(f"{row['path']}: expected a {SOURCE_SHAPE_TEXT} slice, got {array.shape}")
+        # Add the channel dimension: [H, W] -> [1, H, W].
         image = torch.from_numpy(array)[None]
+        # Skip resizing when the requested canvas equals the source size.
         if tuple(array.shape) != (self.image_height, self.image_width):
             image = F.interpolate(
+                # F.interpolate needs a batch dimension, hence image[None] and the trailing
+                # [0]. antialias=True low-pass filters before downsampling to avoid
+                # aliasing.
                 image[None], size=(self.image_height, self.image_width), mode="bilinear",
                 align_corners=False, antialias=True,
             )[0]
         return image.contiguous()
 
     def __len__(self) -> int:
+        """Number of slices in the dataset."""
         return len(self.rows)
 
     def __getitem__(self, index: int) -> Dict[str, object]:
+        """Return {'image': [1, H, W] tensor, 'path': manifest path, 'group_id': case ID}, using the
+        RAM cache when it exists.
+        """
         row = self.rows[index]
         image = self._cache[index] if self._cache is not None else self._load(row)
         return {"image": image, "path": row["path"], "group_id": row["group_id"]}
 
 
 def main() -> None:
+    """CLI entry point: the only sub-command, `audit`, scans the NIfTI folders and writes the manifest CSV.
+    """
     parser = argparse.ArgumentParser(description="Create manifest.csv from the HipMRI NIfTI folders")
     commands = parser.add_subparsers(dest="command", required=True)
     audit = commands.add_parser("audit", help="scan .nii/.nii.gz files and write the manifest")

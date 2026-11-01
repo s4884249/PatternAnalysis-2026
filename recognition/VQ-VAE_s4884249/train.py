@@ -73,8 +73,11 @@ def compute_loss(
         extra["kl_loss"] = output["kl_loss"]
     else:
         loss = reconstruction_term + output["codebook_loss"] + output["commitment_loss"]
+        # In-place dict union: also log the VQ diagnostics next to the loss.
         extra |= {k: output[k] for k in ("codebook_loss", "commitment_loss", "perplexity", "active_codes")}
     metrics = {"loss": loss, "reconstruction_mse": mse, **extra}
+    # The returned metrics are plain Python floats for logging; `loss` stays a tensor so the caller can
+    # call backward() on it.
     return loss, {name: float(value.detach()) for name, value in metrics.items()}, output
 
 
@@ -97,6 +100,8 @@ def run_epoch(
     model.train(training)
     sums: Dict[str, float] = defaultdict(float)
     n_images = 0
+    # inference_mode(True) turns autograd off during evaluation (faster, less memory);
+    # inference_mode(False) changes nothing while training.
     with torch.inference_mode(not training):
         for index, batch in enumerate(loader):
             if limit_batches and index >= limit_batches:
@@ -115,12 +120,16 @@ def run_epoch(
                 metrics["grad_clipped"] = float(grad_norm > GRAD_CLIP)
                 optimizer.step()
             if with_ssim:
+                # SSIM is computed on the CPU with NumPy / scikit-image: take channel 0 to
+                # get [B, H, W] arrays.
                 real = images.clamp(0, 1)[:, 0].cpu().numpy()
                 recon = output["reconstruction"].clamp(0, 1)[:, 0].cpu().numpy()
                 metrics["ssim"] = float(np.mean([ssim_2d(a, b) for a, b in zip(real, recon)]))
             count = int(images.shape[0])
             n_images += count
             for name, value in metrics.items():
+                # Weight each batch mean by its batch size, so dividing by n_images at the
+                # end gives a true per-image mean.
                 sums[name] += value * count
     if n_images == 0:
         raise RuntimeError("Loader produced no images; check the manifest, split and limit_batches.")
@@ -135,6 +144,9 @@ def reconstruct_one(model, image: torch.Tensor, device: torch.device) -> torch.T
 
 
 def plot_history(run_dir: Path, history: List[dict], model_type: str = "") -> None:
+    """Save training_curves.png: train / validation loss on the left, validation SSIM with the assignment
+    target on the right.
+    """
     import matplotlib
 
     matplotlib.use("Agg")
@@ -174,6 +186,9 @@ def make_loaders(splits: Dict[str, List[dict]], data_root: Path, p: TrainParams)
         )
 
         def build(shuffle: bool, gen=None) -> DataLoader:
+            """Create a DataLoader over the current split's dataset (uses `dataset`, `workers` and
+            `p` from the enclosing loop).
+            """
             return DataLoader(
                 dataset,
                 batch_size=p.batch_size,
@@ -184,8 +199,13 @@ def make_loaders(splits: Dict[str, List[dict]], data_root: Path, p: TrainParams)
                 generator=gen,
             )
 
+        # build() is called right away in the same iteration, so using the loop variable `dataset`
+        # inside it is safe.
         loaders[name] = build(name == "train", generator if name == "train" else None)
         if name == "train":
+            # The same training images in a fixed, unshuffled order and without the shuffling
+            # generator, so prior fitting and progress samples never disturb the training
+            # shuffle.
             loaders["train_eval"] = build(False)
     return loaders
 
@@ -222,7 +242,12 @@ def fit_vae_latent_prior(model, loader: DataLoader, device: torch.device, limit_
         variances.append(logvar.cpu().double().exp())
     mu, var = torch.cat(means), torch.cat(variances)
     dim = mu.shape[1]
+    # Covariance of the aggregate posterior = covariance of the posterior means + average posterior
+    # variance (law of total variance). The 1e-5 * I term keeps it positive-definite for the Cholesky
+    # factorisation.
     cov = torch.cov(mu.T) + torch.diag(var.mean(0)) + 1e-5 * torch.eye(dim, dtype=torch.float64)
+    # The Cholesky factor L (cov = L L^T) lets callers sample z = mean + L eps. .float().clone() gives
+    # compact, standalone float32 tensors that are safe to save.
     return {"mean": mu.mean(0).float().clone(), "cholesky": torch.linalg.cholesky(cov).float().clone(), "n_images": int(mu.shape[0])}
 
 
@@ -243,12 +268,19 @@ def generate_snapshot_sample(model, model_type: str, loader: DataLoader, device:
     if model_type == "vae":
         prior = fit_vae_latent_prior(model, loader, device, p.limit_batches)
         eps = torch.randn((1, model.latent_dim), generator=generator)
+        # With eps ~ N(0, I), z = mean + L eps has covariance L L^T. For row vectors this is eps @
+        # L.T.
         z = prior["mean"] + eps @ prior["cholesky"].T
         return model.decode(z.to(device)).clamp(0, 1)[0].cpu()
     codes = collect_code_maps(model, loader, device, p.limit_batches)  # [N, H, W]
     n, height, width = codes.shape
+    # counts[p, k] = how many training images use code k at grid position p.
     counts = torch.zeros(height * width, model.codebook_size)
+    # codes.reshape(n, -1).t() is [positions, n]: for each position, add 1 at the column given by each
+    # image's code.
     counts.scatter_add_(1, codes.reshape(n, -1).t(), torch.ones(height * width, n))
+    # multinomial normalises each row itself, so raw counts act as probabilities; one independent draw
+    # per grid position.
     sampled = torch.multinomial(counts, 1, generator=generator).reshape(1, height, width)
     return model.decode_indices(sampled.to(device)).clamp(0, 1)[0].cpu()
 
@@ -258,9 +290,12 @@ def code_cross_entropy(prior: CodePrior, code_maps: torch.Tensor, batch_size: in
     """Mean next-code cross-entropy (nats per position) of `prior` on a set of code maps."""
     prior.eval()
     total, count = 0.0, 0
+    # TensorDataset yields 1-tuples, hence the (indices,) unpacking.
     for (indices,) in DataLoader(TensorDataset(code_maps), batch_size=batch_size):
         indices = indices.to(device=device, dtype=torch.long)
         logits = prior(indices)
+        # [B, K, H, W] logits become [B*H*W, K] rows matching indices.reshape(-1). reduction='sum'
+        # makes total / count an exact per-position mean even when the last batch is short.
         flat = F.cross_entropy(logits.permute(0, 2, 3, 1).reshape(-1, prior.codebook_size), indices.reshape(-1), reduction="sum")
         total += float(flat)
         count += indices.numel()
@@ -288,22 +323,33 @@ def train_code_prior(
     print(f"[prior] transformer over a {height}x{width} code grid ({height * width} tokens), {count_parameters(prior):,} parameters")
     # AdamW + linear warmup + cosine decay: transformers are unstable at a full LR from step 0.
     def decays(name: str, tensor: torch.Tensor) -> bool:  # weight matrices only, not biases/norms/embeddings
+        """True for tensors that should get weight decay: 2D weight matrices, but not embeddings
+        (biases and norm parameters are 1D).
+        """
         return tensor.ndim == 2 and "embedding" not in name
 
+    # Weight decay only on weight matrices; biases, LayerNorm parameters, embeddings and the BOS vector
+    # are excluded.
     decay = [q for n, q in prior.named_parameters() if decays(n, q)]
     no_decay = [q for n, q in prior.named_parameters() if not decays(n, q)]
     optimizer = torch.optim.AdamW(
+        # beta2 = 0.95 is the usual GPT-style choice (reacts faster than the default 0.999).
         [{"params": decay, "weight_decay": 0.01}, {"params": no_decay, "weight_decay": 0.0}], lr=p.prior_lr, betas=(0.9, 0.95)
     )
     total_steps = p.prior_epochs * len(loader)
+    # Warm up over the first 10% of the steps, capped at 500.
     warmup_steps = max(1, min(500, total_steps // 10))
 
     def lr_factor(step: int) -> float:
+        """Learning-rate multiplier for optimiser step `step`: linear warmup, then cosine decay from
+        1.0 down to 0.1 of the peak rate.
+        """
         if step < warmup_steps:
             return (step + 1) / warmup_steps
         progress = (step - warmup_steps) / max(1, total_steps - warmup_steps)
         return 0.1 + 0.9 * 0.5 * (1.0 + math.cos(math.pi * progress))
 
+    # Stepped once per optimiser step (not per epoch), matching total_steps and lr_factor above.
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_factor)
 
     snapshots = snapshot_epochs(p.prior_epochs)
@@ -323,6 +369,7 @@ def train_code_prior(
                 raise FloatingPointError(f"Non-finite code-prior loss at epoch {epoch}")
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
+            # Same clip value (5.0) as GRAD_CLIP for the autoencoders.
             torch.nn.utils.clip_grad_norm_(prior.parameters(), max_norm=5.0)
             optimizer.step()
             scheduler.step()
@@ -335,6 +382,8 @@ def train_code_prior(
             message += f" val CE={row['val_cross_entropy']:.5f}"
             if row["val_cross_entropy"] < best_ce:
                 best_ce, best_epoch = row["val_cross_entropy"], epoch
+                # Snapshot the weights at the best validation CE; clone() is needed because
+                # the live tensors keep changing.
                 best_state = {k: v.detach().clone() for k, v in prior.state_dict().items()}
         history.append(row)
         print(message)
@@ -349,10 +398,12 @@ def train_code_prior(
             frames.append(sample)
             titles.append(f"Prior epoch {epoch}")
             save_image_grid(torch.stack(frames), run_dir / "prior_samples_by_epoch.png", titles, ncols=len(frames))
+        # Early stopping needs validation maps; prior_patience = 0 disables it.
         if val_maps is not None and p.prior_patience and epoch - best_epoch >= p.prior_patience:
             print(f"[prior] no validation improvement for {p.prior_patience} epochs; stopping (best epoch {best_epoch})")
             break
     elapsed = time.perf_counter() - start
+    # Restore the best epoch, so the over-fitted final weights are not what gets saved.
     if best_state is not None:
         prior.load_state_dict(best_state)
 
@@ -397,6 +448,7 @@ def train_model(
     run_dir.mkdir(parents=True, exist_ok=True)
     set_seed(p.seed)
     device = get_device(p.device)
+    # Device label: CUDA shows the GPU name, MPS says Apple Silicon, CPU shows nothing extra.
     print(f"Device: {device}" + (f" ({torch.cuda.get_device_name(device)})" if device.type == "cuda" else (" (Apple Silicon GPU)" if device.type == "mps" else "")))
 
     # Use the dataset's own train/val/test folders; masks and unreadable files are excluded.
@@ -418,6 +470,8 @@ def train_model(
     val_set = loaders["val"].dataset
     fixed_image = val_set[len(val_set) // 2]["image"]
 
+    # Everything build_model needs plus the paths. It is stored in the checkpoint so evaluation can
+    # rebuild the model without params.py.
     config = asdict(p) | {"data_root": str(data_root), "manifest": str(manifest)}
     model = build_model(model_type, config).to(device)
     n_parameters = count_parameters(model)
@@ -425,6 +479,8 @@ def train_model(
     reset_peak_memory_stats(device)
 
     optimizer = torch.optim.Adam(model.parameters(), lr=p.lr)
+    # Cosine decay of the learning rate to 1% of its starting value over `epochs`, stepped once per
+    # epoch.
     scheduler = (
         torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=p.epochs, eta_min=p.lr * 0.01) if p.cosine_lr else None
     )
@@ -444,6 +500,8 @@ def train_model(
         if scheduler is not None:
             scheduler.step()
         seconds = time.perf_counter() - epoch_start
+        # One CSV row per epoch: the learning rate used, then every train_* and val_* metric
+        # (n_images is dropped).
         history.append(
             {"epoch": epoch, "lr": learning_rate}
             | {f"train_{k}": v for k, v in train_m.items() if k != "n_images"}
@@ -474,6 +532,7 @@ def train_model(
         # Early stopping on validation SSIM (the checkpoint-selection metric).
         stop = bool(p.patience) and epoch - best_epoch >= p.patience
 
+        # Also snapshot on the early-stop epoch, so the progress strips end at the final state.
         if epoch in snapshots or stop:
             recon = reconstruct_one(model, fixed_image, device)
             ssim = ssim_2d(fixed_image[0].numpy(), recon[0].numpy())
@@ -497,6 +556,8 @@ def train_model(
     plot_history(run_dir, history, model_type)
 
     # Final, one-off test evaluation with the best validation checkpoint.
+    # Reload the best-validation weights (the live model holds the LAST epoch). weights_only=True
+    # restricts loading to tensors and plain data, with no pickled code.
     checkpoint = torch.load(run_dir / "best.pt", map_location=device, weights_only=True)
     model.load_state_dict(checkpoint["model_state_dict"])
     test_m = run_epoch(model, loaders["test"], model_type, device, None, p.limit_batches, with_ssim=True, ssim_weight=p.ssim_weight)
@@ -544,6 +605,9 @@ def train_model(
 
 
 def main() -> None:
+    """CLI entry point: parse the model choice and params.py overrides, derive the run directory name, and
+    train.
+    """
     parser = argparse.ArgumentParser(description="Train a VAE or VQ-VAE on 2D HipMRI NIfTI slices")
     parser.add_argument("--model", choices=MODELS, required=True)
     parser.add_argument("--data-root", type=Path, required=True, help="Folder containing the keras_slices_* directories")
@@ -551,6 +615,8 @@ def main() -> None:
     add_overrides(parser, TrainParams())  # any params.py default can be overridden, e.g. --epochs 5
     args = parser.parse_args()
     try:
+        # TrainParams.__post_init__ raises ValueError for invalid combinations; report that as a
+        # normal command-line usage error.
         params = apply_overrides(TrainParams(), args)
     except ValueError as exc:
         parser.error(str(exc))

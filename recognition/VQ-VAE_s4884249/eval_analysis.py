@@ -32,6 +32,9 @@ NN_CANDIDATES = 10         # MSE-nearest candidates re-ranked by SSIM
 
 
 def _jsonable(o):
+    """Recursively convert NumPy types, tuples and non-finite floats into plain JSON-safe values (NaN / inf
+    become null).
+    """
     if isinstance(o, dict):
         return {str(k): _jsonable(v) for k, v in o.items()}
     if isinstance(o, (list, tuple)):
@@ -39,6 +42,7 @@ def _jsonable(o):
     if isinstance(o, np.ndarray):
         return _jsonable(o.tolist())
     if isinstance(o, (np.floating, float)):
+        # NaN and infinity are not valid JSON, so they are stored as null.
         return None if not np.isfinite(o) else float(o)
     if isinstance(o, (np.integer,)):
         return int(o)
@@ -48,6 +52,7 @@ def _jsonable(o):
 
 
 def _ci(values) -> tuple:
+    """Return (mean, lower, upper) of `values`, with a 95% bootstrap confidence interval for the mean."""
     values = np.asarray(values, float)
     lo, hi = M.bootstrap_ci(values, n_boot=500)
     return float(values.mean()), lo, hi
@@ -56,6 +61,7 @@ def _ci(values) -> tuple:
 def training_stats(rows: List[dict]) -> dict:
     """Stability evidence from history.csv."""
     def col(key):
+        """Column `key` of the history rows as a float array, or None when the column is absent."""
         return P._col(rows, key)
 
     if not rows:
@@ -66,6 +72,8 @@ def training_stats(rows: List[dict]) -> dict:
         "best_epoch": int(col("epoch")[int(np.nanargmax(ssim))]),
         "best_val_ssim": float(np.nanmax(ssim)),
         "final_val_ssim": float(ssim[-1]),
+        # Std of the epoch-to-epoch SSIM change over the last 10 epochs (11 values give 10
+        # differences): small means the curve has settled.
         "val_ssim_jitter_last10": float(np.std(np.diff(ssim[-11:]))) if len(ssim) > 2 else None,
         "all_losses_finite": bool(np.isfinite(loss).all() and np.isfinite(col("val_loss")).all()),
         "loss_spikes": int((np.diff(loss) > 0.5 * np.abs(loss[:-1])).sum()) if len(loss) > 1 else 0,  # epochs where loss rose >50%
@@ -76,11 +84,21 @@ def training_stats(rows: List[dict]) -> dict:
                    clip_rate=float(np.nanmean(clipped)) if clipped is not None else None)
     active, ppl = col("val_active_codes"), col("val_perplexity")
     if active is not None:
+        # Skip the first 3 epochs for the minimum: many codes are still being (re)seeded at the
+        # start of training.
         out.update(final_active_codes=float(active[-1]), final_perplexity=float(ppl[-1]), min_active_codes_after_epoch3=float(np.nanmin(active[3:])) if len(active) > 3 else float(active.min()))
     return out
 
 
 def analyse(data: dict, out_dir: Path, seed: int = 0, tsne_points: int = 400, k_modes: int = 10) -> dict:
+    """Compute every metric, write every figure and the markdown report; returns the results dictionary R
+    (also saved as metrics.json).
+
+    data: the dictionary built by evaluate.collect(). The numbered sections below follow the report:
+    1 training stability, 2 reconstructions, 3 uncurated samples, 4 nearest-training-neighbour audit, 5
+    fidelity / coverage / diversity, 6 clarity and artefact detectors, 7 automatic failure autopsy, 8
+    embedding and interpolation, 9 resource profile, then the verdict.
+    """
     out_dir = Path(out_dir)
     figs = out_dir / "figures"
     figs.mkdir(parents=True, exist_ok=True)
@@ -116,8 +134,11 @@ def analyse(data: dict, out_dir: Path, seed: int = 0, tsne_points: int = 400, k_
                       "final_train_cross_entropy": float(ph[-1]["train_cross_entropy"])}
 
     # ------------------------------------------------------------------ 2. reconstructions
+    # Paired per-image SSIM between every test slice and its reconstruction.
     recon_ssim = {m: np.asarray([M.ssim_np(test[i], mt[m]["recon_test"][i]) for i in range(len(test))]) for m in models}
     recon_mse = {m: ((test - mt[m]["recon_test"]) ** 2).mean(axis=(1, 2)) for m in models}
+    # Eight evenly spaced test slices (deterministic, not hand-picked); unique() guards against repeats
+    # if the test set is tiny.
     idx = np.unique(np.linspace(0, len(test) - 1, 8).astype(int))
     P.plot_reconstructions(test, {m: mt[m]["recon_test"] for m in models}, recon_ssim, idx, figs / "fig04_reconstructions.png")
     R["reconstruction"] = {m: {"ssim": _ci(recon_ssim[m]), "ssim_median": float(np.median(recon_ssim[m])), "ssim_min": float(recon_ssim[m].min()),
@@ -134,12 +155,20 @@ def analyse(data: dict, out_dir: Path, seed: int = 0, tsne_points: int = 400, k_
     sets["real_test"] = test
     if mt.get("vqvae", {}).get("recon_control") is not None:
         sets["control"] = mt["vqvae"]["recon_control"]  # reconstructions of TRAINING images: a deliberate "memorised" positive control
+    # nn[key] holds, per image set: d1 (MSE to the nearest training slice), best_ssim and best_idx (the
+    # best SSIM match and which training slice it was).
     nn: Dict[str, dict] = {}
     for key, imgs in sets.items():
+        # Pre-select the NN_CANDIDATES MSE-nearest training slices (cheap), then re-rank them by
+        # SSIM (expensive) in the next line.
         d, ix = M.nn_topk(imgs, train, k=NN_CANDIDATES)
         best, best_ix = M.best_match_ssim(imgs, train, ix)
         nn[key] = {"d1": d[:, 0], "best_ssim": best, "best_idx": best_ix}
+    # Close-match threshold: the 5th percentile of the nearest-train distance of REAL unseen slices. By
+    # construction 5% of real test data is flagged, which is the baseline rate.
     threshold = float(np.quantile(nn["real_test"]["d1"], 0.05))
+    # Equal-size random training subset, so the train and test references have the same size (required
+    # by the data-copying test).
     sub = np.sort(rng.choice(len(train), min(len(test), len(train)), replace=False))
     copy, copy_pairs = {}, {}
     for m in models:
@@ -150,6 +179,8 @@ def analyse(data: dict, out_dir: Path, seed: int = 0, tsne_points: int = 400, k_
     R["memorisation"] = {"close_match_threshold_mse": threshold, "near_duplicate_ssim": NEAR_DUP_SSIM}
     for key in nn:
         groups = train_groups[nn[key]["best_idx"]]
+        # Which patients (cases) the best matches come from: many matches on a single case would
+        # point to collapse onto a few training patients.
         _, counts = np.unique(groups, return_counts=True)
         R["memorisation"][key] = {
             "d1_mean": float(nn[key]["d1"].mean()), "d1_min": float(nn[key]["d1"].min()),
@@ -172,13 +203,19 @@ def analyse(data: dict, out_dir: Path, seed: int = 0, tsne_points: int = 400, k_
         P.plot_triplets(trip, figs / f"fig08_closest_to_training_{m}.png", f"{P.LABELS[m]}: the 6 generated images closest to any training slice")
 
     # ------------------------------------------------------------------ 5. distribution fidelity, coverage, diversity
+    # Feature sets from evaluate.collect: 'train', 'test', 'vae', 'vqvae' plus 'train_idx' (which
+    # training images were used).
     F = data["features"]
     train_f, test_f, gen_f = F["train"], F["test"], {m: F[m] for m in models}
     fd = {m: M.frechet_distance(gen_f[m], train_f) for m in models}
     fd["real_test"] = M.frechet_distance(test_f, train_f)
+    # A second, model-agnostic feature space (pixel PCA). Output order: pix[0] = train, pix[1] = test,
+    # pix[2 + i] = i-th model.
     pix = M.pixel_pca_features(train[F["train_idx"]], test, *[sets[m] for m in models])
     fd_pix = {m: M.frechet_distance(pix[2 + i], pix[0]) for i, m in enumerate(models)}
     fd_pix["real_test"] = M.frechet_distance(pix[1], pix[0])
+    # Precision / recall / density / coverage depend on the sample size, so use equal-size subsets of at
+    # most 1000 per set. Order: bal[0] = train, bal[1] = test, bal[2 + i] = i-th model.
     bal = M.balanced_subsets(train_f, test_f, *[gen_f[m] for m in models], seed=seed, cap=1000)
     prdc = {m: M.prdc(bal[0], bal[2 + i]) for i, m in enumerate(models)}
     prdc["real_test"] = M.prdc(bal[0], bal[1])
@@ -189,20 +226,28 @@ def analyse(data: dict, out_dir: Path, seed: int = 0, tsne_points: int = 400, k_
     P.plot_metric_bars({"recon_ssim": {m: R["reconstruction"][m]["ssim"] for m in models}, "match_ssim": match_ssim,
                         "fd": fd, "fd_name": data["feature_name"], "prdc": prdc}, figs / "fig09_metric_comparison.png")
 
+    # Space for the mode analysis: up to 32 PCA components of the real training features.
     pca_mean, pca_comp = M.pca_fit(train_f, min(32, train_f.shape[1], len(train_f) - 1))
+    # Project any feature set into that PCA space.
     z = lambda a: M.pca_apply(a, pca_mean, pca_comp)
+    # Cluster the REAL training features into k_modes clusters; then count how many generated / test
+    # images land in each.
     centres = M.kmeans(z(train_f), k_modes, seed=seed)
     occ_real = M.occupancy(M.assign_clusters(z(train_f), centres), k_modes)
     occ = {m: M.occupancy(M.assign_clusters(z(gen_f[m]), centres), k_modes) for m in models}
     occ_test = M.occupancy(M.assign_clusters(z(test_f), centres), k_modes)
     pair = {"real_test": M.pairwise_ssim(test, 400, seed)}
     pair.update({m: M.pairwise_ssim(sets[m], 400, seed) for m in models})
+    # Mean distance from each image to its nearest OTHER image of the same cohort: low values mean near-
+    # duplicates.
     intra = {k: float(M.nn_topk(sets[k], sets[k], 1, exclude_self=True)[0][:, 0].mean()) for k in models + ["real_test"]}
     code_usage = None
     vq = mt.get("vqvae", {})
     R["diversity"] = {
         "k_modes": k_modes,
         "tv_distance_to_real_occupancy": {**{m: M.total_variation(occ[m], occ_real) for m in models}, "real_test": M.total_variation(occ_test, occ_real)},
+        # A cluster counts as dropped when the cohort fills it with less than 25% of the real share;
+        # real test data gives the natural floor for this count.
         "mode_drops": {**{m: int((occ[m] < 0.25 * occ_real).sum()) for m in models}, "real_test": int((occ_test < 0.25 * occ_real).sum())},
         "pairwise_ssim_mean": {k: float(v.mean()) for k, v in pair.items()},
         "intra_cohort_nn_mse": intra,
@@ -218,6 +263,8 @@ def analyse(data: dict, out_dir: Path, seed: int = 0, tsne_points: int = 400, k_
 
     # ------------------------------------------------------------------ 6. clarity + artefact detectors
     art = {k: {"sharp": M.sharpness(sets[k]), "checker": M.checkerboard_score(sets[k]), "mask": M.body_mask_stats(sets[k])} for k in models + ["real_test"]}
+    # Artefact thresholds come from REAL test images (95th percentile), so a 'flag' means worse than 95%
+    # of real data; a 5% flag rate is expected for real images.
     chk95 = float(np.quantile(art["real_test"]["checker"], 0.95))
     frag95 = float(np.quantile(art["real_test"]["mask"]["fragmentation"], 0.95))
     sharp_med = float(np.median(art["real_test"]["sharp"]))
@@ -234,8 +281,14 @@ def analyse(data: dict, out_dir: Path, seed: int = 0, tsne_points: int = 400, k_
     R["autopsy"] = {}
     for m in models:
         a, n = art[m], len(sets[m])
+        # Mean distance to the 5 nearest real training feature vectors: large values mean the sample
+        # lies off the real manifold.
         knn = np.sort(M.pairwise_distances(gen_f[m], train_f), axis=1)[:, :5].mean(1)
+        # Fragmentation score plus a small penalty for every extra connected component.
         frag = a["mask"]["fragmentation"] + 0.05 * np.maximum(a["mask"]["n_components"] - 1, 0)
+        # One row per failure type: (name, score where HIGHER = worse, function describing the
+        # evidence for sample i). Sharpness and best-match SSIM are negated because LOW values are
+        # bad for them.
         crit = [
             ("checkerboard / high-frequency artefact", a["checker"], lambda i: f"Nyquist-corner energy {a['checker'][i]:.3g} (real 95th pct {chk95:.3g})"),
             ("fragmented tissue margin", frag, lambda i: f"body mask fragmentation {a['mask']['fragmentation'][i]:.2f}, {a['mask']['n_components'][i]} components (real 95th pct frag {frag95:.2f})"),
@@ -245,10 +298,14 @@ def analyse(data: dict, out_dir: Path, seed: int = 0, tsne_points: int = 400, k_
         ]
         used, trip, table = set(), [], []
         for name, score, describe in crit:
+            # Take the worst-scoring sample that was not already chosen for another criterion,
+            # so the failure examples are different images.
             i = next(int(c) for c in np.argsort(-score) if int(c) not in used)
             used.add(i)
             j = int(nn[m]["best_idx"][i])
             s = int(np.asarray(mt[m]["gen_seed"])[i])
+            # Position of the sample inside its own seed's batch (the cohort is concatenated
+            # seed by seed).
             pos = int(i - np.flatnonzero(np.asarray(mt[m]["gen_seed"]) == s)[0])
             trip.append({"image": sets[m][i], "neighbor": train[j], "title": f"{name}: {describe(i)} | seed {s} #{pos} | nearest train case {train_groups[j]} (SSIM {nn[m]['best_ssim'][i]:.2f})"})
             table.append({"failure_type": name, "seed": s, "index": pos, "evidence": describe(i), "nearest_case": str(train_groups[j]), "nearest_ssim": float(nn[m]["best_ssim"][i])})
@@ -256,6 +313,8 @@ def analyse(data: dict, out_dir: Path, seed: int = 0, tsne_points: int = 400, k_
         R["autopsy"][m] = table
 
     # ------------------------------------------------------------------ 8. embedding + interpolation
+    # Random subsample of at most tsne_points rows (order preserved) to keep t-SNE fast and the groups
+    # balanced.
     pick = lambda arr: arr[np.sort(rng.choice(len(arr), min(tsne_points, len(arr)), replace=False))]
     parts = [("real_train", pick(train_f)), ("real_test", pick(test_f))] + [(m, pick(gen_f[m])) for m in models]
     emb, method = P.embed_2d(np.concatenate([p for _, p in parts]), seed)
@@ -270,6 +329,7 @@ def analyse(data: dict, out_dir: Path, seed: int = 0, tsne_points: int = 400, k_
     prof = {}
     for m in models:
         rs = mt[m]["run_summary"]
+        # The VQ-VAE total includes prior training; the VAE only has the plain training time.
         seconds = rs.get("total_training_plus_prior_wall_seconds") or rs.get("training_wall_seconds")
         prof[m] = {"params_m": (mt[m]["n_params"] + (mt[m].get("prior_params") or 0)) / 1e6, "train_minutes": seconds / 60 if seconds else None,
                    "train_peak_mb": rs.get("peak_accelerator_memory_mb") or rs.get("peak_cuda_memory_mb"),
@@ -288,10 +348,20 @@ def analyse(data: dict, out_dir: Path, seed: int = 0, tsne_points: int = 400, k_
 # verdict
 # ======================================================================================================
 def verdict(R: dict, m: str) -> dict:
+    """Rule-based verdict for model `m` from the result dictionary R.
+
+    Every criterion uses the constants at the top of this file. Returns {'label': overall verdict text,
+    'criteria': one entry per rule (group, text, measured value, pass), 'failed': failed criteria
+    grouped by area}.
+    """
     mem, fid, div, cl = R["memorisation"][m], R["fidelity"], R["diversity"], R["clarity"]
     copy = mem["data_copying_test"]
     floor = fid["prdc"]["real_test"]
+    # A metric relative to the real-test floor (the realistic best case for a synthetic cohort);
+    # max(..., 1e-9) avoids division by zero.
     rel = lambda key: fid["prdc"][m][key] / max(floor[key], 1e-9)
+    # (group, criterion text, displayed value, passed?) rows; all thresholds are the constants defined
+    # at the top of the file.
     crit = [
         ("Fidelity", f"Test reconstruction SSIM > {SSIM_TARGET}", f"{R['reconstruction'][m]['ssim'][0]:.3f}", R["reconstruction"][m]["ssim"][0] > SSIM_TARGET),
         ("Fidelity", f"Synthetic best-match SSIM to real slices > {SSIM_TARGET}", f"{mem['best_match_ssim'][0]:.3f}", mem["best_match_ssim"][0] > SSIM_TARGET),
@@ -308,6 +378,8 @@ def verdict(R: dict, m: str) -> dict:
     ]
     items = [{"group": g, "criterion": c, "value": v, "pass": bool(p)} for g, c, v, p in crit]
     failed = {g: [i["criterion"] for i in items if i["group"] == g and not i["pass"]] for g in ("Fidelity", "Memorisation", "Diversity", "Plausibility")}
+    # Verdict hierarchy: any memorisation failure is the most serious outcome; otherwise any other
+    # failure means 'no evidence of memorisation but not fit for use'; otherwise 'conditionally safe'.
     if failed["Memorisation"]:
         label = "NOT SAFE TO SHARE: memorisation criteria failed"
     elif any(failed.values()):
@@ -321,19 +393,30 @@ def verdict(R: dict, m: str) -> dict:
 # markdown
 # ======================================================================================================
 def _tbl(header: List[str], rows: List[List[str]]) -> str:
+    """Render a markdown table from a header list and a list of rows (cells are converted with str())."""
     return "\n".join(["| " + " | ".join(header) + " |", "|" + "|".join("---" for _ in header) + "|"] + ["| " + " | ".join(map(str, r)) + " |" for r in rows])
 
 
 def _ci_text(t) -> str:
+    """Format a (mean, lower, upper) tuple as 'mean [lower, upper]' with three decimals."""
     return f"{t[0]:.3f} [{t[1]:.3f}, {t[2]:.3f}]"
 
 
 def write_markdown(R: dict, path: Path) -> None:
+    """Write EVALUATION_RESULTS.md from the results dictionary R: verdict, setup, training stability,
+    clarity / diversity, benchmark tables, failure autopsy, memorisation audit and recommendations, with
+    the figures embedded from figures/.
+    """
     models = R["models"]
+    # Display names used in the tables.
     L = {"vae": "VAE", "vqvae": "VQ-VAE", "real_test": "Real test (floor)", "control": "Train reconstructions (control)"}
+    # Unpack the result sections into short names used throughout the report.
     s, rec, mem, fid, div, cl, tr, res = (R[k] for k in ("setup", "reconstruction", "memorisation", "fidelity", "diversity", "clarity", "training", "resources"))
+    # Markdown for an embedded figure plus an italic caption; paths are relative to the report
+    # (figures/<name>).
     F = lambda name, caption: f"![{caption}](figures/{name})\n\n*{caption}*\n"
     out: List[str] = []
+    # w(text) appends one block of markdown; the report is the blocks joined by newlines.
     w = out.append
 
     w("# Evaluation results: VQ-VAE vs VAE baseline on HipMRI slices\n")
@@ -386,6 +469,8 @@ def write_markdown(R: dict, path: Path) -> None:
     w("## 3. Baseline vs VQ-VAE: sample clarity, diversity, fidelity\n")
     w(F("fig06_real_vs_synthetic.png", "Random real (train, test) and synthetic images; rows are not curated"))
     w(F("fig11_clarity.png", "Clarity: radial power spectrum (blur removes high frequencies), Laplacian sharpness and Nyquist-corner (checkerboard) energy"))
+    # In these tables, `*[...]` expands to one cell per column: the real-test floor first, then each
+    # model.
     w(_tbl(["Clarity", *[L[k] for k in ["real_test", *models]]],
            [["Median Laplacian sharpness (ratio to real)", *[f"{cl[k]['sharpness_ratio_to_real']:.2f}" for k in ["real_test", *models]]],
             ["Checkerboard flag rate (>real p95; real = 5%)", *[f"{cl[k]['checkerboard_flag_rate']:.1%}" for k in ["real_test", *models]]],

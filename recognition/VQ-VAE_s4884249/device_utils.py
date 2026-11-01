@@ -9,7 +9,9 @@ def get_device(requested: str | torch.device = "auto") -> torch.device:
     `auto` prefers CUDA, then Apple Silicon MPS, then CPU. An explicit `mps`
     request fails clearly if the installed PyTorch build cannot use MPS.
     """
+    # Accepts a string or a torch.device; compare case-insensitively.
     name = str(requested).lower()
+    # Matches both 'cuda' and an indexed device such as 'cuda:0'.
     if name.startswith("cuda"):
         if torch.cuda.is_available():
             return torch.device(name)
@@ -42,6 +44,7 @@ def sync(device: torch.device) -> None:
         torch.mps.synchronize()
 
 def reset_peak_memory_stats(device: torch.device) -> None:
+    """Reset CUDA's peak-memory counter before a measured section (no-op on MPS and CPU)."""
     if device.type == "cuda":
         torch.cuda.reset_peak_memory_stats(device)
     # MPS does not expose a CUDA-style resettable peak allocator statistic.

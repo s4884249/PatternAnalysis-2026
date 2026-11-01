@@ -18,6 +18,9 @@ from device_utils import get_device, sync  # noqa: F401
 
 
 def set_seed(seed: int) -> None:
+    """Seed Python, NumPy and PyTorch (CPU and every CUDA device) and make cuDNN deterministic so repeated
+    runs match.
+    """
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
@@ -29,6 +32,9 @@ def set_seed(seed: int) -> None:
 
 
 def to_device(batch: Dict[str, object], device: torch.device) -> torch.Tensor:
+    """Return the batch's 'image' tensor on `device` as float32. non_blocking is only used for CUDA, where
+    it can overlap the copy with compute.
+    """
     return batch["image"].to(device=device, dtype=torch.float32, non_blocking=(device.type == "cuda"))
 
 
@@ -55,33 +61,48 @@ def ssim_torch(real: torch.Tensor, recon: torch.Tensor, window: int = 11, sigma:
     coords = torch.arange(window, dtype=real.dtype, device=real.device) - (window - 1) / 2.0
     kernel_1d = torch.exp(-(coords**2) / (2 * sigma**2))
     kernel_1d = kernel_1d / kernel_1d.sum()
+    # The outer product of two 1D Gaussians gives a separable 2D window; the two leading dimensions make
+    # it a conv2d weight [out=1, in=1, 11, 11] applied to single-channel images.
     kernel = (kernel_1d[:, None] * kernel_1d[None, :])[None, None]
 
     def blur(x: torch.Tensor) -> torch.Tensor:
+        """Gaussian-window convolution (valid padding) used for the local means, variances and
+        covariance.
+        """
         return F.conv2d(x, kernel)
 
     mu_x, mu_y = blur(real), blur(recon)
+    # Local variances and covariance computed as E[x^2] - E[x]^2 and E[xy] - E[x]E[y] with the Gaussian
+    # window as the expectation.
     var_x = blur(real * real) - mu_x * mu_x
     var_y = blur(recon * recon) - mu_y * mu_y
     cov = blur(real * recon) - mu_x * mu_y
+    # Standard SSIM stabilising constants (K1 = 0.01, K2 = 0.03) for a data range of 1.
     c1, c2 = 0.01**2, 0.03**2
     ssim_map = ((2 * mu_x * mu_y + c1) * (2 * cov + c2)) / ((mu_x**2 + mu_y**2 + c1) * (var_x + var_y + c2))
     return ssim_map.mean()
 
 
 def save_json(path: Path, obj: object) -> None:
+    """Write `obj` as indented JSON (creating parent folders); NaN / inf raise instead of producing invalid
+    JSON.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
     # allow_nan=False makes a NaN metric fail loudly instead of writing invalid JSON.
     path.write_text(json.dumps(obj, indent=2, allow_nan=False) + "\n", encoding="utf-8")
 
 
 def read_json(path: Path) -> dict:
+    """Load a JSON file, raising FileNotFoundError with a clear message when it is missing."""
     if not path.is_file():
         raise FileNotFoundError(f"Missing required experiment artifact: {path}")
     return json.loads(path.read_text(encoding="utf-8"))
 
 
 def write_csv(path: Path, rows: Sequence[Dict[str, object]]) -> None:
+    """Write a list of dict rows to CSV; the header is the union of all keys, so rows with extra columns
+    are kept.
+    """
     if not rows:
         return
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -113,6 +134,7 @@ def save_image_grid(
     ncols = min(ncols, max(1, count))
     nrows = int(np.ceil(count / ncols))
     fig, axes = plt.subplots(nrows, ncols, figsize=(ncols * 1.6, nrows * 2.2), squeeze=False)
+    # Every axis is switched off first, so unused cells in the last row stay blank.
     for i, ax in enumerate(axes.flat):
         ax.axis("off")
         if i < count:

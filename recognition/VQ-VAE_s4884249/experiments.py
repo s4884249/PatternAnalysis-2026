@@ -98,6 +98,9 @@ def sweepable() -> Dict[str, type]:
 # generation metrics (NumPy only; shared reference context so every run is scored identically)
 # --------------------------------------------------------------------------------------
 def _features(images: np.ndarray, ctx: dict) -> np.ndarray:
+    """Project images into the shared pixel-PCA space stored in ctx (4x average pooling, then the PCA
+    fitted on the reference slices).
+    """
     mean, comps = ctx["pca"]
     return M.pca_apply(M.avg_pool(images, 4).reshape(len(images), -1), mean, comps)
 
@@ -105,15 +108,19 @@ def _features(images: np.ndarray, ctx: dict) -> np.ndarray:
 def make_context(ref: np.ndarray, test: np.ndarray, n_gen: int, seed: int = 0) -> dict:
     """Reference statistics computed once: pixel-PCA space, real-test floors, close-match threshold."""
     rng = np.random.default_rng(seed)
+    # n = the common subset size, so every precision / recall computation compares equal-size sets.
     n = int(min(n_gen, len(test), len(ref)))
     if n <= 6:
         raise ValueError("Need more than 6 reference and test images")
     pooled = M.avg_pool(ref, 4).reshape(len(ref), -1)
     ctx = {"n": n, "ref": ref}
+    # At most (samples - 1) components exist for that many samples.
     ctx["pca"] = M.pca_fit(pooled, min(64, len(ref) - 1))
     ref_f, test_f = _features(ref, ctx), _features(test, ctx)
     ref_sub = np.sort(rng.choice(len(ref), n, replace=False))
     test_sub = np.sort(rng.choice(len(test), n, replace=False))
+    # Real test slices against the reference pool: gives the close-match threshold and the real floor
+    # for best-match SSIM.
     d_test, ix_test = M.nn_topk(test, ref, k=5)
     best_test, _ = M.best_match_ssim(test, ref, ix_test)
     ctx.update(
@@ -121,6 +128,8 @@ def make_context(ref: np.ndarray, test: np.ndarray, n_gen: int, seed: int = 0) -
         sharp_median=float(np.median(M.sharpness(test))), checker_p95=float(np.quantile(M.checkerboard_score(test), 0.95)),
     )
     prdc = M.prdc(ref_f[ref_sub], test_f[test_sub])
+    # 'Real floors': the same metrics computed for held-out REAL slices, i.e. the best a perfect
+    # generator could expect.
     ctx["floors"] = {
         "gen_fd": M.frechet_distance(test_f, ref_f), "gen_precision": prdc["precision"], "gen_recall": prdc["recall"],
         "gen_coverage": prdc["coverage"], "gen_density": prdc["density"], "gen_match_ssim": float(best_test.mean()),
@@ -134,11 +143,13 @@ def generation_metrics(gen: np.ndarray, codes: Optional[np.ndarray], ctx: dict, 
     feats = _features(gen, ctx)
     d, ix = M.nn_topk(gen, ctx["ref"], k=5)
     best, _ = M.best_match_ssim(gen, ctx["ref"], ix)
+    # Equal-size sets: the reference subset (n images) against the first n generated images.
     prdc = M.prdc(ctx["ref_sub_f"], feats[: ctx["n"]])
     out = {
         "gen_fd": M.frechet_distance(feats, ctx["ref_f"]),
         "gen_precision": prdc["precision"], "gen_recall": prdc["recall"], "gen_density": prdc["density"], "gen_coverage": prdc["coverage"],
         "gen_match_ssim": float(best.mean()), "gen_match_ssim_above_target": float((best > SSIM_TARGET).mean()),
+        # 0.95 is the near-duplicate SSIM threshold (same as NEAR_DUP_SSIM in eval_analysis.py).
         "gen_close_match_rate": float((d[:, 0] <= ctx["close_threshold"]).mean()), "gen_near_dup_rate": float((best >= 0.95).mean()),
         "gen_sharpness_ratio": float(np.median(M.sharpness(gen)) / max(ctx["sharp_median"], 1e-12)),
         "gen_checker_rate": float((M.checkerboard_score(gen) > ctx["checker_p95"]).mean()),
@@ -159,6 +170,8 @@ def build_context(args, base: TrainParams) -> dict:
     rng = np.random.default_rng(0)
     rows = splits["train"]
     if args.ref_images and len(rows) > args.ref_images:
+        # Optional random subset of the training slices (sorted to keep file order) to bound memory
+        # and time.
         rows = [rows[i] for i in np.sort(rng.choice(len(rows), args.ref_images, replace=False))]
     print(f"Loading {len(rows)} reference and {len(splits['test'])} test slices for the generation metrics ...")
     hw = (base.image_height, base.image_width)
@@ -168,6 +181,9 @@ def build_context(args, base: TrainParams) -> dict:
 
 
 def _free_memory() -> None:
+    """Release memory between runs: run Python garbage collection and, when PyTorch with CUDA is available,
+    empty the CUDA cache.
+    """
     import gc
 
     gc.collect()
@@ -176,6 +192,7 @@ def _free_memory() -> None:
 
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
+    # PyTorch is not installed: nothing more to free.
     except ImportError:
         pass
 
@@ -183,9 +200,11 @@ def _free_memory() -> None:
 def sample_and_score(run_dir: Path, params: TrainParams, ctx: dict, args) -> Dict[str, float]:
     """Sample from a trained run (uncurated, fixed seed) and score it. Cached in generation_metrics.json."""
     cache = run_dir / "generation_metrics.json"
+    # Everything that influences the cached numbers; the cache is only reused when all of these match.
     settings = {"gen_samples": args.gen_samples, "gen_seed": args.gen_seed, "temperature": args.temperature, "top_k": args.top_k, "ref_n": ctx["n"]}
     if cache.is_file() and not args.rerun:
         stored = read_json(cache)
+        # Same settings: reuse the cache and return the metrics without the settings keys.
         if {k: stored.get(k) for k in settings} == settings:
             return {k: v for k, v in stored.items() if k not in settings}
     from device_utils import get_device
@@ -198,8 +217,11 @@ def sample_and_score(run_dir: Path, params: TrainParams, ctx: dict, args) -> Dic
     metrics = generation_metrics(cohort["gen"], codes, ctx)
     metrics["gen_ms_per_sample"] = 1000.0 * cohort["gen_seconds_per_sample"]
     metrics["gen_peak_mb"] = cohort["gen_peak_mb"]
+    # Keep 16 samples in half precision for the later samples figure.
     np.save(run_dir / "samples_preview.npy", cohort["gen"][:16].astype(np.float16))
+    # Stored together with the settings so the cache can be validated next time.
     save_json(cache, metrics | settings)
+    # Drop the model before the next training run starts, then free memory.
     del run
     _free_memory()
     return metrics
@@ -213,6 +235,8 @@ def run_one(model: str, params: TrainParams, args, root: Path, value: float, rep
     run_dir = root / "runs" / run_dir_name(model, params)
     summary_path = run_dir / "run_summary.json"
     need_prior = args.with_generation and model == "vqvae"
+    # A finished run is reused unless --rerun is given; with generation enabled, a VQ-VAE run must also
+    # have its prior (prior.pt).
     reusable = summary_path.is_file() and not args.rerun and (not need_prior or (run_dir / "prior.pt").is_file())
     if reusable:
         print(f"Reusing finished run: {run_dir}")
@@ -256,16 +280,25 @@ def aggregate(rows: Sequence[Dict[str, object]]) -> Dict[Tuple[str, float], Dict
     out = {}
     for key, members in groups.items():
         stats = {}
+        # Union of the metric names over the repeats (rows can differ, e.g. the VAE has no codebook
+        # statistics).
         for metric in {k for r in members for k in r if k not in NON_METRIC}:
+            # Keep only finite real numbers: bool is a Real subclass so it is excluded
+            # explicitly, and None / NaN are ignored.
             vals = np.asarray([r[metric] for r in members if isinstance(r.get(metric), numbers.Real) and not isinstance(r.get(metric), bool) and np.isfinite(r[metric])], float)
             if len(vals):
+                # Sample standard deviation (ddof=1); 0.0 when there is a single repeat.
                 stats[metric] = (float(vals.mean()), float(vals.std(ddof=1)) if len(vals) > 1 else 0.0, int(len(vals)))
         out[key] = stats
     return out
 
 
 def _series(agg, model: str, key: str, values: Sequence[float]):
+    """Collect (x values, means, stds) of one metric for one model across the swept values; three empty
+    arrays when nothing exists.
+    """
     pts = [(v, *agg[(model, v)][key][:2]) for v in values if (model, v) in agg and key in agg[(model, v)]]
+    # zip(*pts) transposes [(value, mean, std), ...] into (values, means, stds).
     return tuple(map(np.asarray, zip(*pts))) if pts else (np.array([]),) * 3
 
 
@@ -273,6 +306,7 @@ def _series(agg, model: str, key: str, values: Sequence[float]):
 # figures
 # --------------------------------------------------------------------------------------
 def _plt():
+    """Import matplotlib lazily with the headless Agg backend and return pyplot."""
     import matplotlib
 
     matplotlib.use("Agg")  # headless backend for clusters
@@ -282,25 +316,36 @@ def _plt():
 
 
 def _style_axis(ax, values, log_x: bool, param: str) -> None:
+    """Common x-axis styling: optional log scale, ticks exactly at the swept values, a label and a light
+    grid.
+    """
     if log_x:
         ax.set_xscale("log")
     ax.set_xticks(values)
     ax.set_xticklabels([f"{v:g}" for v in values], fontsize=8)
+    # No minor ticks: on a log axis they would clutter the labelled swept values.
     ax.minorticks_off()
     ax.set_xlabel(param)
     ax.grid(alpha=0.2)
 
 
 def _panel(ax, agg, models, values, key: str, title: str, ref=None, ref_label: str = "", floors: Optional[dict] = None, log_y: bool = False) -> bool:
+    """Plot mean +/- std of one metric for every model; add a dashed reference line (a fixed value, or the
+    real-data floor when ref == 'floor'). Returns True if any data was drawn, otherwise the panel shows
+    'n/a'.
+    """
     drawn = False
     for model in models:
         x, y, s = _series(agg, model, key, values)
         if len(x):
+            # yerr is None when every std is 0 (single repeat), which draws no error bars.
             ax.errorbar(x, y, yerr=s if s.any() else None, marker="o", capsize=3, color=COLORS[model], label=LABELS[model])
             drawn = True
     if not drawn:
         ax.text(0.5, 0.5, "n/a", ha="center", va="center", transform=ax.transAxes)
     else:
+        # ref == 'floor' means: use the real-data floor for this metric; otherwise ref is the line
+        # value itself (or None).
         line = (floors or {}).get(key) if ref == "floor" else ref
         if line is not None:
             ax.axhline(line, color="gray", ls="--", lw=1, label=ref_label)
@@ -312,6 +357,9 @@ def _panel(ax, agg, models, values, key: str, title: str, ref=None, ref_label: s
 
 
 def plot_effect(agg, param, models, values, log_x, path: Path) -> None:
+    """2x3 figure of reconstruction quality and cost (test SSIM / MSE, training time, memory, parameters,
+    best epoch) versus the swept value.
+    """
     plt = _plt()
     fig, axes = plt.subplots(2, 3, figsize=(15, 8))
     for ax, (title, key, ref, label) in zip(axes.flat, EFFECT_PANELS):
@@ -324,6 +372,9 @@ def plot_effect(agg, param, models, values, log_x, path: Path) -> None:
 
 
 def plot_codebook(agg, param, values, log_x, path: Path) -> bool:
+    """Figure of VQ-VAE codebook usage (active codes, perplexity, perplexity of sampled codes) versus the
+    swept value; returns False when no such data exists.
+    """
     keys = [("test_active_codes", "Active codes (test split)"), ("test_perplexity", "Codebook perplexity (test split)"), ("gen_code_perplexity", "Perplexity of codes sampled by the prior")]
     if not any(len(_series(agg, "vqvae", k, values)[0]) for k, _ in keys):
         return False
@@ -332,6 +383,8 @@ def plot_codebook(agg, param, values, log_x, path: Path) -> bool:
     for ax, (key, title) in zip(axes, keys):
         _panel(ax, agg, ["vqvae"], values, key, title)
         if param == "codebook-size":
+            # The y = x line: perfect codebook usage means every code of the swept size is
+            # active.
             ax.plot(values, values, ":", color="gray", label="codebook size")
             ax.legend(fontsize=7)
         _style_axis(ax, values, log_x, param)
@@ -343,6 +396,9 @@ def plot_codebook(agg, param, values, log_x, path: Path) -> bool:
 
 
 def plot_generation(agg, param, models, values, log_x, floors, path: Path) -> None:
+    """2x4 figure of the generation metrics (realism, diversity, memorisation, sharpness, artefacts) versus
+    the swept value, with real-data references.
+    """
     plt = _plt()
     fig, axes = plt.subplots(2, 4, figsize=(20, 8))
     for ax, (title, key, ref, label) in zip(axes.flat, GEN_PANELS):
@@ -355,11 +411,16 @@ def plot_generation(agg, param, models, values, log_x, floors, path: Path) -> No
 
 
 def plot_learning_curves(rows, param, models, values, path: Path) -> None:
+    """Validation SSIM and validation MSE per epoch for every swept value (first repeat only), one column
+    per model.
+    """
     plt = _plt()
     fig, axes = plt.subplots(2, len(models), figsize=(7.5 * len(models), 8), squeeze=False)
+    # One colour per swept value; stopping at 0.9 avoids the pale yellow end of the colour map.
     colors = plt.cm.viridis(np.linspace(0, 0.9, len(values)))
     for c, model in enumerate(models):
         for color, value in zip(colors, values):
+            # Curves come from the first repeat only (repeat == 0).
             run = next((r for r in rows if r["model"] == model and r["value"] == value and r["repeat"] == 0), None)
             hist = read_history(Path(run["run_dir"]) / "history.csv") if run else []
             if not hist:
@@ -405,6 +466,9 @@ def plot_tradeoff(agg, param, models, values, path: Path, floors: dict) -> None:
 
 
 def plot_samples(rows, param, models, values, path: Path) -> bool:
+    """One strip per (model, value) with the first 8 stored samples of the first repeat; returns False when
+    no sample previews exist.
+    """
     entries = []
     for model in models:
         for value in values:
@@ -431,6 +495,7 @@ def plot_samples(rows, param, models, values, path: Path) -> bool:
 # report
 # --------------------------------------------------------------------------------------
 def _fmt(stat, digits: int = 4) -> str:
+    """Format a (mean, std, n) statistic as 'mean +/- std' (std only when n > 1); None becomes 'n/a'."""
     if stat is None:
         return "n/a"
     mean, std, n = stat
@@ -439,14 +504,21 @@ def _fmt(stat, digits: int = 4) -> str:
 
 
 def _score(key: str, mean: float) -> float:
+    """Sort key where larger is always better: direction * mean, or the negative distance from 1 for
+    metrics whose best value is 1 (direction 0).
+    """
     direction = DIRECTION.get(key, 1)
     return -abs(mean - 1.0) if direction == 0 else direction * mean
 
 
 def _trend(values: Sequence[float], means: List[float]) -> str:
+    """Describe in words how a metric changes across the swept values (flat, monotonic, interior maximum /
+    minimum or non-monotonic).
+    """
     if len(means) < 3:
         return "too few values for a trend"
     means = list(means)
+    # Peak-to-peak range essentially zero relative to the scale of the values: the metric is flat.
     if np.ptp(means) <= 1e-6 * max(abs(m) for m in means) + 1e-12:
         return "is flat"
     d = np.diff(means)
@@ -463,6 +535,9 @@ def _trend(values: Sequence[float], means: List[float]) -> str:
 
 
 def write_report(path: Path, param: str, rows, agg, models, values, floors: Optional[dict], info: dict) -> None:
+    """Write the markdown report: per-model result tables, best value per criterion (with a seed-noise
+    check), trends, a suggested value under the project criteria, and caveats.
+    """
     w: List[str] = []
     cols = [("test_ssim", "test SSIM"), ("test_mse", "test MSE"), ("best_epoch", "best ep"), ("training_seconds", "train s"), ("parameters", "params")]
     if any("test_active_codes" in a for a in agg.values()):
@@ -497,6 +572,8 @@ def write_report(path: Path, param: str, rows, agg, models, values, floors: Opti
             if not cand:
                 cells.append("n/a")
                 continue
+            # Best candidate first, according to each metric's direction (higher / lower /
+            # closest to 1).
             cand.sort(key=lambda c: _score(key, c[1][0]), reverse=True)
             note = ""
             if len(cand) > 1:
@@ -504,6 +581,8 @@ def write_report(path: Path, param: str, rows, agg, models, values, floors: Opti
                 if best[2] < 2:
                     note = "single seed: noise unknown"
                 else:
+                    # Rule of thumb: a gap larger than twice the bigger seed std counts
+                    # as a real difference.
                     gap, noise = abs(best[0] - second[0]), max(best[1], second[1])
                     note = "distinguishable from runner-up" if gap > 2 * noise else "within seed noise of runner-up"
             cells.append(f"**{cand[0][0]:g}** ({_fmt(cand[0][1])}; {note})" if note else f"**{cand[0][0]:g}**")
@@ -533,10 +612,14 @@ def write_report(path: Path, param: str, rows, agg, models, values, floors: Opti
                     why.append("best-match SSIM <= 0.6")
                 if a.get("gen_close_match_rate", (1.0,))[0] > 0.10:
                     why.append("close-match rate > 10%")
+            # Expression used as a statement: record the value as failed (with its reasons) or
+            # as qualifying.
             (failures.append(f"{v:g} ({', '.join(why)})") if why else ok.append(v))
         if not ok:
             w.append(f"- {LABELS[m]}: no value meets the criteria. Failures: {'; '.join(failures)}.")
         else:
+            # With generation metrics the lowest sample FD wins; without them the highest test
+            # SSIM wins.
             best = min(ok, key=lambda v: agg[(m, v)]["gen_fd"][0]) if floors is not None else max(ok, key=lambda v: agg[(m, v)]["test_ssim"][0])
             w.append(f"- {LABELS[m]}: **{best:g}** (qualifying values: {', '.join(f'{v:g}' for v in ok)}" + (f"; rejected: {'; '.join(failures)}" if failures else "") + ").")
     w.append("\n## Caveats\n")
@@ -550,6 +633,9 @@ def write_report(path: Path, param: str, rows, agg, models, values, floors: Opti
 # main
 # --------------------------------------------------------------------------------------
 def main() -> None:
+    """CLI entry point: validate the sweep, train / reuse a run for every (repeat, value, model), score
+    generations if requested, then aggregate, plot and write the report and a console summary.
+    """
     options = sweepable()
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--param", required=True, choices=sorted(options), help="parameter to sweep")
@@ -569,12 +655,14 @@ def main() -> None:
     args = parser.parse_args()
 
     name = args.param.replace("-", "_")
+    # int or float: the parsed values are cast to this type.
     kind = options[args.param]
     try:
         base = apply_overrides(TrainParams(), args)
         values = [float(v) for v in args.values]
         if kind is int and not all(v.is_integer() for v in values):
             raise ValueError(f"--param {args.param} needs integer values")
+        # De-duplicate and sort the swept values.
         values = sorted({kind(v) for v in values})
         if len(values) < 2:
             raise ValueError("--values needs at least two different values")
@@ -593,6 +681,8 @@ def main() -> None:
     suffix = "" if name in ("seed", "epochs") else f"_seed{base.seed}x{base.epochs}"
     out_dir = (args.output_dir or EXPERIMENTS_DIR / f"{name.replace('_', '-')}{suffix}").resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
+    # A parameter owned by one model is swept for that model only; shared parameters are not in
+    # MODEL_SPECIFIC, so the default (m) selects both models.
     models = [m for m in MODELS if MODEL_SPECIFIC.get(name, m) == m]
     seeds = [base.seed + r for r in range(args.repeats)]
     print(f"Sweeping {args.param} over {values} for: {', '.join(LABELS[m] for m in models)} | seeds {seeds}"
@@ -610,6 +700,8 @@ def main() -> None:
     rows: List[Dict[str, object]] = []
     for repeat, seed in enumerate(seeds):
         for value in values:
+            # Set the swept value and this repeat's seed (unless the seed itself is the swept
+            # parameter).
             params = replace(base, **{name: value}, **({} if name == "seed" else {"seed": seed}))
             for model in models:
                 print(f"\n=== {LABELS[model]} | {args.param}={value:g} | seed {params.seed} ===")
@@ -617,6 +709,8 @@ def main() -> None:
                 write_csv(out_dir / "results.csv", rows)  # written after every run: an interrupted sweep keeps its results
 
     agg = aggregate(rows)
+    # Flatten the aggregates into one row per (model, value) with <metric>_mean, <metric>_std and
+    # <metric>_n columns.
     summary_rows = [{"model": m, "value": v, **{f"{k}_{s}": stat[i] for k, stat in a.items() for i, s in enumerate(("mean", "std", "n"))}} for (m, v), a in sorted(agg.items())]
     write_csv(out_dir / "summary.csv", summary_rows)
     log_x = min(values) > 0 and max(values) / min(values) >= 10  # log axis when values span 10x or more (typical for learning rates)

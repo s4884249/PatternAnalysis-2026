@@ -27,20 +27,37 @@ from params import TrainParams, add_overrides, apply_overrides
 
 
 # ----------------------------------------------------------------------------- parameter counting
+# Parameter count of a Conv2d / ConvTranspose2d with a k x k kernel: i*o*k*k weights plus o biases.
 def conv(i, o, k): return i * o * k * k + o            # Conv2d / ConvTranspose2d with bias
+# Parameter count of an affine GroupNorm over c channels (one scale and one shift per channel).
 def gn(c): return 2 * c                                 # GroupNorm (affine)
+# Parameter count of a Linear layer: i*o weights, plus o biases when `bias` is True.
 def lin(i, o, bias=True): return i * o + (o if bias else 0)
+# Parameter count of one ResBlock from modules.py: two (GroupNorm, SiLU, 3x3 conv) units. SiLU has no
+# parameters.
 def res(c): return 2 * conv(c, c, 3) + 2 * gn(c)        # ResBlock: 2 x (GN, SiLU, 3x3 conv)
 
 
 def vae_counts(p: TrainParams) -> dict:
+    """Per-block trainable-parameter counts of the baseline VAE, following modules.VAE layer by layer.
+
+    Returns a dict with per-stage lists ('enc_blocks', 'dec_blocks'), single-layer counts, the flattened
+    feature size ('flat') and the grand 'total'. The result feeds both the drawing and the printed
+    summary.
+    """
     s, b = p.downsample_stages, p.base_channels
     fc = 32  # VAE.feature_channels
+    # Spatial size after `s` stride-2 convolutions is H/2^s x W/2^s; the feature map is flattened into
+    # the posterior Linear.
     flat = fc * (p.image_height // 2**s) * (p.image_width // 2**s)
     widths = [b * 2**i for i in range(s)]
+    # Each encoder block is Conv 4x4 stride 2 + GroupNorm. The first takes the 1-channel image, later
+    # ones take the previous block's width.
     enc = [conv(1 if i == 0 else widths[i - 1], w, 4) + gn(w) for i, w in enumerate(widths)]
     c = {"enc_blocks": enc, "enc_conv": conv(widths[-1], fc, 3), "to_posterior": lin(flat, 2 * p.vae_latent_dim),
          "from_latent": lin(p.vae_latent_dim, flat), "dec_conv": conv(fc, widths[-1], 3)}
+    # The decoder mirrors the encoder: ConvTranspose blocks run from the widest width down to widths[0];
+    # the final ConvTranspose (dec_out) outputs 1 channel.
     c["dec_blocks"] = [conv(widths[i], widths[i - 1], 4) + gn(widths[i - 1]) for i in range(s - 1, 0, -1)]
     c["dec_out"] = conv(widths[0], 1, 4)
     c["total"] = sum(enc) + c["enc_conv"] + c["to_posterior"] + c["from_latent"] + c["dec_conv"] + sum(c["dec_blocks"]) + c["dec_out"]
@@ -49,12 +66,22 @@ def vae_counts(p: TrainParams) -> dict:
 
 
 def vq_counts(p: TrainParams) -> dict:
+    """Per-block trainable-parameter counts of the VQ-VAE autoencoder (encoder + decoder), following
+    modules.py.
+
+    The EMA codebook is not trainable, so it is reported separately ('codebook_untrained') and left out
+    of 'total'; 'ema_buffers' lists the extra non-trainable state the EMA update keeps.
+    """
     s, b, D, K, R = p.vq_downsample_stages, p.base_channels, p.latent_dim, p.codebook_size, p.res_blocks
+    # VQ widths start at 2 x base_channels (see modules._vq_widths); the plain VAE starts at
+    # base_channels.
     widths = [b * 2 ** (i + 1) for i in range(s)]
     c = {"enc_in": conv(1, b, 3) + res(b)}
     c["enc_stages"] = [conv(b if i == 0 else widths[i - 1], w, 4) + res(w) for i, w in enumerate(widths)]
     c["enc_out"] = R * res(widths[-1]) + gn(widths[-1]) + conv(widths[-1], D, 1)
     c["dec_in"] = conv(D, widths[-1], 3) + R * res(widths[-1])
+    # Decoder output widths per upsampling stage: the encoder widths in reverse, finishing at
+    # base_channels (e.g. [64, 32] for widths [64, 128]).
     outs = list(reversed(widths[:-1])) + [b]
     prev, c["dec_stages"] = widths[-1], []
     for o in outs:
@@ -67,9 +94,16 @@ def vq_counts(p: TrainParams) -> dict:
 
 
 def prior_counts(p: TrainParams) -> dict:
+    """Parameter counts of the transformer code prior (modules.CodePrior): embeddings, one block, all
+    blocks, output head, plus the code-grid size ('grid') and the 'total'.
+    """
     d, K, L = p.prior_hidden, p.codebook_size, p.prior_layers
+    # Code-grid size = image size divided by the VQ downsampling factor (2^stages).
     grid = (p.image_height // 2**p.vq_downsample_stages, p.image_width // 2**p.vq_downsample_stages)
     block = 2 * 2 * d + lin(d, 3 * d) + lin(d, d) + lin(d, 4 * d) + lin(4 * d, d)  # 2 LayerNorm + qkv + proj + 2 MLP linears
+    # embeddings = token table (K x d) + BOS vector (d) + learned row (H' x d) and column (W' x d)
+    # position tables.
+    # head = final LayerNorm (2d) + bias-free Linear d -> K.
     c = {"embeddings": K * d + d + grid[0] * d + grid[1] * d, "block": block, "blocks": L * block, "head": 2 * d + d * K, "grid": grid}
     c["total"] = c["embeddings"] + c["blocks"] + c["head"]
     return c
@@ -79,6 +113,7 @@ def prior_counts(p: TrainParams) -> dict:
 GRAY, BLUE, TEAL, ORANGE, RED, GOLD, PURPLE = "#e5e5e5", "#cfe2f3", "#cdebdf", "#fde0c5", "#f6c9c9", "#fff2b3", "#e0d4f0"
 
 
+# Format a parameter count compactly: '1.23 M', '4.5 k', or the plain integer for small numbers.
 def fmt(n): return f"{n / 1e6:.2f} M" if n >= 1e6 else (f"{n / 1e3:.1f} k" if n >= 1e3 else str(n))
 
 
@@ -86,6 +121,7 @@ def chain(ax, y, items, x0=2.0, x1=98.0, h=9.0):
     """Draw boxes left to right; returns [(x, w)] per box. item = (title, subtitle, colour, params or None)."""
     n = len(items)
     gap = 3.2
+    # Box width chosen so that n boxes plus (n - 1) gaps exactly fill the span x0..x1.
     w = (x1 - x0 - gap * (n - 1)) / n
     spots = []
     for k, (title, sub, color, params) in enumerate(items):
@@ -93,15 +129,21 @@ def chain(ax, y, items, x0=2.0, x1=98.0, h=9.0):
         ax.add_patch(FancyBboxPatch((x, y), w, h, boxstyle="round,pad=0.15,rounding_size=0.8", fc=color, ec="#333", lw=1))
         ax.text(x + w / 2, y + h * 0.70, title, ha="center", va="center", fontsize=8, fontweight="bold")
         ax.text(x + w / 2, y + h * 0.28, sub, ha="center", va="center", fontsize=7.2)
+        # The parameter count (when given) is printed just below the box.
         if params is not None:
             ax.text(x + w / 2, y - 1.5, params, ha="center", va="center", fontsize=7.5, color="#555")
         if k:
+            # Arrow from the previous box's right edge to this box's left edge (empty text: only
+            # the arrow is drawn).
             ax.annotate("", xy=(x - 0.1, y + h / 2), xytext=(x - gap + 0.1, y + h / 2), arrowprops=dict(arrowstyle="-|>", lw=1.2, color="#333"))
         spots.append((x, w))
     return spots
 
 
 def elbow(ax, x_from, y_from, x_to, y_to, y_mid, label=None):
+    """Draw an elbow connector: a line from (x_from, y_from) to height y_mid, across to x_to, then an arrow
+    pointing into (x_to, y_to). An optional italic label is written just above the horizontal run.
+    """
     ax.plot([x_from, x_from, x_to], [y_from, y_mid, y_mid], color="#333", lw=1.2)
     ax.annotate("", xy=(x_to, y_to), xytext=(x_to, y_mid), arrowprops=dict(arrowstyle="-|>", lw=1.2, color="#333"))
     if label:
@@ -109,9 +151,17 @@ def elbow(ax, x_from, y_from, x_to, y_to, y_mid, label=None):
 
 
 def draw(p_vae: TrainParams, p_vq: TrainParams, out: Path) -> None:
+    """Render the three-row architecture figure and save it to `out`.
+
+    Row 1: VAE encoder / decoder. Row 2: VQ-VAE encoder / quantiser / decoder. Row 3: the transformer
+    prior that generates code maps for the VQ-VAE decoder. `p_vae` and `p_vq` are the settings of the
+    two final models (they differ only in ssim_weight by default).
+    """
     H, W = p_vq.image_height, p_vq.image_width
     v, q, pr = vae_counts(p_vae), vq_counts(p_vq), prior_counts(p_vq)
     fig, ax = plt.subplots(figsize=(21, 15.5))
+    # Work in an abstract 0-100 x 0-112 coordinate system, so every layout number below is relative
+    # rather than in pixels.
     ax.set_xlim(0, 100); ax.set_ylim(0, 112); ax.axis("off")
     h = 9.0
 
@@ -132,7 +182,9 @@ def draw(p_vae: TrainParams, p_vq: TrainParams, out: Path) -> None:
         dec.append(("ConvT 4×4 s2\nGN · SiLU", f"{widths[i - 1]}×{H // 2**(i)}×{W // 2**(i)}", BLUE, fmt(v["dec_blocks"][k])))
     dec.append(("ConvT 4×4 s2\nsigmoid  = output", f"1×{H}×{W}", BLUE, fmt(v["dec_out"])))
     ye, yd = 93.0, 77.0
+    # chain() returns each box's (x, width), which the connector arrows below use as anchor points.
     a = chain(ax, ye, enc); d = chain(ax, yd, dec)
+    # Connector from the end of the encoder row (right) back to the start of the decoder row (left).
     elbow(ax, a[-1][0] + a[-1][1] - 2, ye - 3.0, d[0][0] + 2, yd + h, 87.0, "latent")
 
     # ---------------- VQ-VAE
@@ -158,6 +210,7 @@ def draw(p_vae: TrainParams, p_vq: TrainParams, out: Path) -> None:
 
     # ---------------- prior
     T = pr["grid"][0] * pr["grid"][1]
+    # Same rule as modules.CodePrior: attention heads have size 32, so heads = width / 32.
     heads = max(1, p_vq.prior_hidden // 32)
     ax.text(2, 27.0, f"Generation: causal transformer prior over the {pr['grid'][0]}×{pr['grid'][1]} code grid ({T} tokens)   |   trained after the autoencoder with AdamW (lr {p_vq.prior_lr:g}, up to {p_vq.prior_epochs} epochs, early stop on validation cross-entropy)", fontsize=10, fontweight="bold")
     items = [("Code map", f"{pr['grid'][0]}×{pr['grid'][1]} → {T} tokens\nraster order", GRAY, None),
@@ -167,8 +220,11 @@ def draw(p_vae: TrainParams, p_vq: TrainParams, out: Path) -> None:
              ("Sample next code", "temperature, top-k,\nkey/value cache", GOLD, None)]
     yp = 12.0
     pch = chain(ax, yp, items)
+    # The sampled code map is fed back into the decoder row, closing the generation loop.
     elbow(ax, pch[-1][0] + pch[-1][1] - 2, yp + h, d[0][0] + 2, yd, 33.0, "sampled code map → embedding lookup → decoder")
 
+    # Legend built from (colour, meaning) pairs; Patch objects are used because the boxes are drawn as
+    # patches, not plotted lines.
     ax.legend(handles=[Patch(fc=c, ec="#333", label=l) for c, l in [(GRAY, "input / data"), (BLUE, "plain conv block"), (TEAL, "residual conv block"), (ORANGE, "linear / embedding"),
                                                                      (RED, "vector quantiser"), (PURPLE, "transformer"), (GOLD, "latent / sampling")]],
               loc="lower center", ncol=7, frameon=False, fontsize=9, bbox_to_anchor=(0.5, -0.005))
@@ -180,6 +236,9 @@ def draw(p_vae: TrainParams, p_vq: TrainParams, out: Path) -> None:
 
 
 def main() -> None:
+    """CLI entry point: parse the params.py overrides, draw the figure, then print the parameter breakdown
+    (a JSON summary plus the per-part dictionaries).
+    """
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--out", type=Path, default=Path("images/final_architecture.png"))
     add_overrides(parser, TrainParams())  # same overrides as train.py; applied to both models

@@ -35,10 +35,16 @@ def plot_utilisation(counts: Dict[str, np.ndarray], out: Path) -> Dict[str, dict
     order = np.argsort(-freq["train"])  # codes sorted by training usage, shared by every curve
     stats = {}
     for k, c in counts.items():
+        # Cumulative share when this set's codes are ranked by their OWN frequency, most used first.
         cum = np.cumsum(np.sort(freq[k])[::-1])
         stats[k] = {"active": int((c > 0).sum()), "perplexity": M.entropy_perplexity(c),
+                    # Smallest number of codes whose cumulative share reaches q
+                    # (searchsorted returns a 0-based position, +1 turns it into a
+                    # count).
                     **{f"codes_for_{int(q * 100)}%": int(np.searchsorted(cum, q) + 1) for q in (0.5, 0.9, 0.99)}}
     fig, (a, b, c) = plt.subplots(1, 3, figsize=(17, 4.8))
+    # Zero counts cannot be drawn on a log axis, so unused codes are clamped to a tiny positive floor
+    # (half of one assignment out of the pooled total).
     floor = 0.5 / max(sum(v.sum() for v in counts.values()), 1)  # draw unused codes on a log axis
     for k in counts:
         s = stats[k]
@@ -52,6 +58,8 @@ def plot_utilisation(counts: Dict[str, np.ndarray], out: Path) -> Dict[str, dict
     b.plot([0, K], [0, 1], color="gray", ls="--", lw=1, label="uniform use")
     b.set(xlabel="number of codes (most used first)", ylabel="cumulative share of assignments", title="Cumulative utilisation")
     if "generated" in counts:
+        # Both axes share the same limits so the dashed y = x diagonal means 'prior reproduces
+        # training usage exactly'.
         lim = [max(floor, 1e-6), max(freq["train"].max(), freq["generated"].max()) * 1.5]
         c.scatter(np.maximum(freq["train"], floor), np.maximum(freq["generated"], floor), s=8, alpha=0.6, color=COLORS["generated"])
         c.plot(lim, lim, "k--", lw=1)
@@ -72,6 +80,9 @@ def plot_utilisation(counts: Dict[str, np.ndarray], out: Path) -> Dict[str, dict
 
 
 def main() -> None:
+    """CLI entry point: load a trained VQ-VAE run, count code usage for training images, test images and
+    (optionally) prior samples, then plot and print the utilisation statistics.
+    """
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--run", type=Path, required=True, help="VQ-VAE run directory (needs best.pt, split.json, run_summary.json)")
     p.add_argument("--data-root", type=Path, default=None, help="default: the data root stored in the checkpoint")
@@ -99,13 +110,20 @@ def main() -> None:
     for name in ("train", "test"):
         rows = run["split"][name]
         if len(rows) > args.max_images:
+            # Randomly subsample the split (indices sorted to keep file order) to bound the
+            # runtime.
             rows = [rows[i] for i in np.sort(rng.choice(len(rows), args.max_images, replace=False))]
         images, _, _ = load_images(rows, root, *hw, args.workers)
+        # Encode the images to [N, H, W] code maps, flatten, and histogram: counts[k] = how often
+        # code k was chosen. minlength=K keeps unused codes as explicit zeros.
         counts[name] = np.bincount(train_code_maps(run["model"], images, device, args.batch_size).ravel(), minlength=K)
     if args.samples > 0:
         try:
+            # Positional arguments: seeds=[seed], per_seed=samples, temperature=1.0, top_k=0,
+            # i.e. plain untuned sampling from the prior.
             cohort = generate_cohort(run, hw, [args.seed], args.samples, device, 1.0, 0)
             counts["generated"] = np.bincount(cohort["latents"].numpy().ravel(), minlength=K)
+        # prior.pt missing or not a transformer prior: continue without the 'generated' curve.
         except (FileNotFoundError, RuntimeError) as exc:
             print(f"Skipping prior samples: {exc}")
     stats = plot_utilisation(counts, args.out)

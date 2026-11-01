@@ -38,6 +38,7 @@ def parse_name(row: Dict[str, str]):
 def load_stack(rows: List[Dict[str, str]], data_root: Path, params: TrainParams) -> np.ndarray:
     """Preprocessed slices ([N, H, W] in [0, 1]) through the same dataset class training uses."""
     dataset = NiftiSliceDataset(rows, data_root, params.image_height, params.image_width)
+    # [0] drops the channel dimension, giving an [N, H, W] array.
     return np.stack([dataset[i]["image"][0].numpy() for i in range(len(dataset))])
 
 
@@ -90,6 +91,8 @@ def build_report(rows: List[Dict[str, str]]) -> tuple[List[str], dict]:
     out("")
     out("== Image / mask pairing ==")
     img_keys = {(r["group_id"], *p) for r, p in parsed if p}
+    # Walrus operator: parse each mask name once and skip names that do not parse. Masks (seg_XXX_...)
+    # yield the same (case, week, slice) key as their image.
     mask_keys = {(r["group_id"], *p) for r in masks if (p := parse_name(r))}
     out(f"images with a mask: {len(img_keys & mask_keys)} / {len(img_keys)} | masks without an image: {len(mask_keys - img_keys)}")
 
@@ -113,6 +116,9 @@ def build_report(rows: List[Dict[str, str]]) -> tuple[List[str], dict]:
 
 
 def plot_overview(a: dict, path: Path) -> None:
+    """Draw the 2x3 manifest overview (files per split, slices per case / week, raw shapes, intensity
+    ranges) and save it to `path`.
+    """
     import matplotlib.pyplot as plt
 
     fig, axes = plt.subplots(2, 3, figsize=(15, 8))
@@ -141,6 +147,7 @@ def plot_overview(a: dict, path: Path) -> None:
 
     for ax, key, title in ((axes[1, 1], "max", "Raw per-slice maximum intensity"),
                            (axes[1, 2], "nonzero_frac", "Fraction of non-zero pixels per slice")):
+        # Boolean selection per split lets each histogram show only that split's values.
         split_of = np.array([r["split"] for r in a["images"]])
         for s in SPLITS:
             if (split_of == s).any():
@@ -155,6 +162,9 @@ def plot_overview(a: dict, path: Path) -> None:
 
 
 def plot_samples(a: dict, data_root: Path, params: TrainParams, per_split: int, rng, path: Path) -> None:
+    """Save a grid of `per_split` random preprocessed slices per split (exactly what the models see),
+    labelled with case, week and slice.
+    """
     import matplotlib.pyplot as plt
 
     fig, axes = plt.subplots(len(SPLITS), per_split, figsize=(per_split * 1.8, len(SPLITS) * 2.5), squeeze=False)
@@ -166,6 +176,8 @@ def plot_samples(a: dict, data_root: Path, params: TrainParams, per_split: int, 
             ax.axis("off")
             if c < len(picked):
                 ax.imshow(stack[c], cmap="gray", vmin=0, vmax=1)
+                # parse_name returns None for unexpected file names; show '?' instead of
+                # failing.
                 week, sl = parse_name(picked[c]) or ("?", "?")
                 ax.set_title(f"{s}\n{picked[c]['group_id']} w{week} s{sl}", fontsize=7)
     fig.tight_layout()
@@ -174,6 +186,9 @@ def plot_samples(a: dict, data_root: Path, params: TrainParams, per_split: int, 
 
 
 def main() -> None:
+    """CLI entry point: print and save the dataset report, then write the overview, sample and pixel-
+    statistics figures.
+    """
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--data-root", type=Path, required=True)
     parser.add_argument("--manifest", type=Path, default=MANIFEST)
