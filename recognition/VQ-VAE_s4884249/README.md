@@ -53,13 +53,14 @@ The dataset will be divided into training, validation, and test sets before mode
 ### Model Architecture and Difficulty
 
 **Model:** Vector-Quantised Variational Autoencoder (VQ-VAE) + Autoregressive Prior
+
 **Difficulty band:** Hard Difficulty
 
 VQ-VAE uses an encoder to map an image into a lower-dimensional latent representation. The representation is quantized by assigning latent vectors to entries in a learned discrete codebook. A decoder then reconstructs the image from the quantized representation. The training objective combines reconstruction loss with terms that train the codebook and encourage the encoder to use its discrete representations effectively.
 
 The discrete latent representation provides a way to learn recurring image structures, but it can also introduce reconstruction artefacts or under-use of the codebook. These behaviours will be investigated through reconstruction comparisons, codebook usage statistics, and generated sample grids.
 
-The implementation will use PyTorch and run on the Rangpur A100 GPU cluster. The architecture will begin with a relatively small convolutional encoder and decoder, with the latent dimensionality, codebook size, and reconstruction objective selected to suit the resolution and characteristics of the dataset.
+Using PyTorch, the architecture will begin with a relatively small convolutional encoder and decoder, with the latent dimensionality, codebook size, and reconstruction objective selected to suit the resolution and characteristics of the dataset.
 
 ### Relevant Course Concepts and Literature
 
@@ -256,11 +257,11 @@ _Figure 3: Training losses, validation SSIM, reconstruction MSE, gradient norms,
 
 Training stability was assessed using finite-loss checks, epoch-to-epoch loss changes, gradient norms, gradient clipping frequency, validation performance, and VQ-VAE codebook utilisation. The autoregressive prior was evaluated separately using training and validation cross-entropy.
 
-Both autoencoders completed 50 training epochs without non-finite losses or loss spikes exceeding a 50% increase between consecutive epochs. Neither required gradient clipping. Mean pre-clipping gradient norms were 0.01 for the VAE and 0.08 for the VQ-VAE. Validation SSIM fluctuations during the final ten epochs were also small, with standard deviations of successive changes of 0.0002 and 0.0001, respectively.
+Both autoencoders completed 50 training epochs without non-finite losses or loss spikes exceeding a 50% increase between consecutive epochs. Neither required gradient clipping. Mean pre-clipping gradient norms were `0.01` for the VAE and `0.08` for the VQ-VAE. Validation SSIM fluctuations during the final ten epochs were also small, with standard deviations of successive changes of `0.0002` and `0.0001`, respectively.
 
-The VQ-VAE's detailed training history shows that its reconstruction quality improved throughout training. Validation MSE decreased from 0.00286 to 0.000958, while validation SSIM increased from 0.842 to 0.941. Gradient norms declined from 0.338 to 0.016, without any clipping events. Although the total validation loss increased after reaching its minimum at epoch 5, this occurred alongside improving reconstruction metrics and increasing codebook and commitment losses, indicating a trade-off between objective components rather than numerical divergence.
+The VQ-VAE's detailed training history shows that its reconstruction quality improved throughout training. Validation MSE decreased from 0.00286 to 0.000958, while validation SSIM increased from `0.842` to `0.941`. Gradient norms declined from `0.338` to `0.016`, without any clipping events. Although the total validation loss increased after reaching its minimum at epoch 5, this occurred alongside improving reconstruction metrics and increasing codebook and commitment losses, indicating a trade-off between objective components rather than numerical divergence.
 
-Codebook utilisation also remained healthy. Active training entries increased from approximately 191 to all 512 entries, with final training and validation perplexities of approximately 390 and 394, respectively. This provides no evidence of severe codebook collapse.
+Codebook utilisation also remained healthy. Active training entries increased from approximately `191` to all `512` entries, with final training and validation perplexities of approximately `390` and `394`, respectively. This provides no evidence of severe codebook collapse.
 
 ![Transformer prior training curves](images/evaluation_prior_training.png)
 
@@ -388,7 +389,7 @@ The later hyperparameter experiments provide supporting architectural evidence. 
 
 _Figure 13 - Metric Comparision_
 
-The SSIM acceptance threshold of 0.6 is evaluated using paired held-out test reconstructions. Both the VAE and VQ-VAE exceed this threshold, demonstrating that their respective decoders preserve substantial structural information from their input slices.
+The SSIM acceptance threshold of `0.6` is evaluated using paired held-out test reconstructions. Both the VAE and VQ-VAE exceed this threshold, demonstrating that their respective decoders preserve substantial structural information from their input slices.
 
 This result should not be interpreted as demonstrating equivalent similarity for prior-generated synthetic images. Generated-image fidelity and diversity are evaluated separately using feature-space Fréchet distance, precision, recall, coverage and nearest-neighbour similarity. These metrics compare properties of generated and real cohorts rather than the reconstruction accuracy of individual input images.
 
@@ -400,7 +401,7 @@ The VQ-VAE achieves a lower Inception-v3 feature-space Fréchet distance than th
 
 _Figure 14: VQ-VAE - Latent-space interpolation between a training image and a synthetic image_
 
-To investigate the structure of the learned latent representation, linear interpolation was performed between two encoded HipMRI slices. Intermediate latent representations were generated at nine interpolation coefficients, ranging from α = 0.00 to α = 1.00, and decoded using the VQ-VAE decoder.
+To investigate the structure of the learned latent representation, linear interpolation was performed between two encoded HipMRI slices. Intermediate latent representations were generated at nine interpolation coefficients, ranging from `α = 0.00` to `α = 1.00`, and decoded using the VQ-VAE decoder.
 
 For linear interpolation, the intermediate representation is calculated as:
 
@@ -437,7 +438,7 @@ The higher VQ-VAE training latency and memory requirements make it more sensitiv
 
 ### Experimental protocol
 
-Three one-factor-at-a-time hyperparameter sweeps were conducted using `experiments.py`. Each configuration was trained for 30 epochs across three random seeds (42, 43, 44), with results reported as mean ± standard deviation. Unless otherwise specified, the VQ-VAE configuration used the default codebook size of 512, an SSIM loss weight of 0, and two downsampling stages. The SSIM loss weight of 0 was used rather than the current model's 0.1 for a closer comparison with the baseline model.
+Three one-factor-at-a-time hyperparameter sweeps were conducted using `experiments.py`. Each configuration was trained for 30 epochs across three random seeds (42, 43, 44), with results reported as mean ± standard deviation. Unless otherwise specified, the VQ-VAE configuration used the default codebook size of `512`, an SSIM loss weight of `0`, and two downsampling stages. The SSIM loss weight of `0` was used rather than the current model's `0.1` for a closer comparison with the baseline model.
 
 Reconstruction quality was assessed using test SSIM and mean squared error (MSE). Generated-sample quality was assessed using best-match SSIM, pixel-PCA Fréchet distance (FD), precision, recall, coverage, close-match rate, and sharpness ratio. Codebook utilization and prior validation cross-entropy (CE) were recorded where applicable.
 
@@ -453,9 +454,9 @@ Reconstruction quality was assessed using test SSIM and mean squared error (MSE)
 
 *Arrows indicate the preferred direction. Values are mean ± standard deviation across three seeds.*
 
-Increasing the codebook size improved reconstruction quality monotonically. Increasing it from 512 to 1024 raised test SSIM from 0.9245 to 0.9323 and reduced MSE from 0.001016 to 0.0009107. FD also decreased from 0.8993 to 0.8777, while precision and sharpness ratio increased.
+Increasing the codebook size improved reconstruction quality monotonically. Increasing it from `512` to `1024` raised test SSIM from `0.9245` to `0.9323` and reduced MSE from 0.001016 to 0.0009107. FD also decreased from `0.8993` to `0.8777`, while precision and sharpness ratio increased.
 
-However, these gains did not extend to every criterion. Recall and best-match SSIM were highest at 128, and the close-match rate at 512 was substantially higher than at the other tested sizes. The 1024-entry codebook therefore offers a promising reconstruction and sample-quality trade-off, but its larger latent vocabulary does not by itself establish better privacy or anatomical validity. The differences in FD and close-match rate should also be interpreted in light of variation across seeds.
+However, these gains did not extend to every criterion. Recall and best-match SSIM were highest at `128`, and the close-match rate at `512` was substantially higher than at the other tested sizes. The `1024` entry codebook therefore offers a promising reconstruction and sample-quality trade-off, but its larger latent vocabulary does not by itself establish better privacy or anatomical validity. The differences in FD and close-match rate should also be interpreted in light of variation across seeds.
 
 ### 2. SSIM loss weight
 
@@ -474,11 +475,11 @@ However, these gains did not extend to every criterion. Recall and best-match SS
 
 *Values are mean ± standard deviation. Bold identifies selected reference values or the best observed value for a particular metric within each model; it does not imply statistical significance.*
 
-For the VAE baseline, increasing the SSIM weight improved test SSIM but increased MSE and FD. A weight of 0.05 produced the lowest close-match rate, while larger weights generally increased the sharpness ratio. This illustrates that better reconstruction structure does not necessarily imply better generated-sample distribution quality.
+For the VAE baseline, increasing the SSIM weight improved test SSIM but increased MSE and FD. A weight of `0.05` produced the lowest close-match rate, while larger weights generally increased the sharpness ratio. This illustrates that better reconstruction structure does not necessarily imply better generated-sample distribution quality.
 
-For the VQ-VAE, a weight of 0.05 is a promising alternative to the current weight of 0.1. It achieved a test SSIM of 0.9438, a slightly lower MSE of 0.0009531, and a lower close-match rate of 0.0898, compared with 0.9458, 0.0009610, and 0.0977 at 0.1. Its recall was also slightly lower, while FD was lower than at 0.1 but remained variable across seeds.
+For the VQ-VAE, a weight of `0.05` is a promising alternative to the current weight of `0.1`. It achieved a test SSIM of 0.9438, a slightly lower MSE of `0.0009531`, and a lower close-match rate of `0.0898`, compared with `0.9458`, `0.0009610`, and `0.0977` at `0.1`. Its recall was also slightly lower, while FD was lower than at `0.1` but remained variable across seeds.
 
-A weight of 0.25 produced the highest mean recall in this sweep, whereas 0.5 produced the highest mean test SSIM and precision. Neither was uniformly better: best-match SSIM declined as the weight increased beyond 0.1, and the close-match rate increased at 0.25 and 0.5. The modest reconstruction gains at higher weights therefore do not justify selecting them on SSIM alone.
+A weight of `0.25` produced the highest mean recall in this sweep, whereas `0.5` produced the highest mean test SSIM and precision. Neither was uniformly better: best-match SSIM declined as the weight increased beyond `0.1`, and the close-match rate increased at `0.25` and `0.5`. The modest reconstruction gains at higher weights therefore do not justify selecting them on SSIM alone.
 
 ### 3. Number of downsampling stages
 
@@ -495,7 +496,7 @@ The two-stage architecture should therefore remain the default. A deeper encoder
 
 The sweeps reveal trade-offs between reconstruction fidelity, sample diversity, distributional similarity, and potential memorisation. Although all configurations exceeded the reconstruction SSIM threshold, none provided uniformly improved results that would justify an imediate change to the model configuration.
 
-The held-out real-data reference values were FD = 3.7, precision = 0.875, recall = 0.0703, coverage = 0.492, density = 0.777, best-match SSIM = 0.335, and pairwise SSIM = 0.164. The generated-sample FD values were lower than the real-data reference under the same evaluation procedure, but this should not be interpreted as proof that synthetic samples are more realistic. These metrics use pixel-PCA features and small cohorts, so their absolute values are not equivalent to published FID results. In particular, the very different precision and recall values indicate that the generated and real sample distributions behave differently under the evaluator.
+The held-out real-data reference values were FD = `3.7`, precision = `0.875`, recall = `0.0703`, coverage = `0.492`, density = `0.777`, best-match SSIM = `0.335`, and pairwise SSIM = `0.164`. The generated-sample FD values were lower than the real-data reference under the same evaluation procedure, but this should not be interpreted as proof that synthetic samples are more realistic. These metrics use pixel-PCA features and small cohorts, so their absolute values are not equivalent to published FID results. In particular, the very different precision and recall values indicate that the generated and real sample distributions behave differently under the evaluator.
 
 Close-match rate is a useful screening measure, not a privacy guarantee. Best-match SSIM also measures similarity rather than clinical correctness: a high value can indicate faithful anatomical structure, but it can also indicate excessive similarity to a training example. Conversely, a low value does not establish anatomical plausibility or safety. None of the reported metrics establishes concrete diagnostic utility, preservation of pathology, or absence of patient information.
 
@@ -507,9 +508,9 @@ The current configuration (`codebook_size=512`, `ssim_weight=0.1`, and two downs
 
 1. **Increase the codebook size to 1024.** This setting improved mean test SSIM, MSE, FD, precision, and sharpness ratio in the codebook sweep. The trade-off is reduced recall relative to 128 and no clear improvement in best-match SSIM. Evaluate whether the larger codebook improves anatomical detail without increasing training-image similarity or reducing sample diversity.
 
-2. **Reduce the SSIM weight to 0.05.** Relative to 0.1, this setting slightly improved MSE and reduced the mean close-match rate from 0.0977 to 0.0898, with a small decrease in test SSIM. It is a promising candidate for reducing excessive similarity, but the close-match result has substantial seed variability and does not demonstrate privacy.
+2. **Reduce the SSIM weight to 0.05.** Relative to `0.1`, this setting slightly improved MSE and reduced the mean close-match rate from `0.0977` to `0.0898`, with a small decrease in test SSIM. It is a promising candidate for reducing excessive similarity, but the close-match result has substantial seed variability and does not demonstrate privacy.
 
-3. **Retain two downsampling stages.** Three stages increased parameter count from approximately 2.0M to 7.9M and degraded reconstruction and several generation metrics. Further architecture changes should focus on preserving spatial detail and avoiding artefacts rather than simply increasing depth.
+3. **Retain two downsampling stages.** Three stages increased parameter count from approximately `2.0M` to `7.9M` and degraded reconstruction and several generation metrics. Further architecture changes should focus on preserving spatial detail and avoiding artefacts rather than simply increasing depth.
 
 4. **Evaluate the combined configuration.** The next experiment should combine `codebook_size=1024`, `ssim_weight=0.05`, and `downsample_stages=2`. This configuration combines promising results from the individual sweeps, but the joint effect is unknown because the hyper-parameters were varied separately. Train it with the same data split, epoch budget, and seeds as the reference model. Compare the combined model against the current configuration and the best individual alternatives before accepting the change.
 
@@ -550,7 +551,7 @@ Claude (Anthropic) was used throughout this project to assist in the generation 
 
 1. Initial scaffolding and implementation of `modules.py` and `dataset.py`, and the `train.py` training loop base on decisions made in the initial feasibility specification.
 2. Iterations on the initial model designs including converting the baseline model from an AE to VAE.
-3. The production of tools such as `explore.py`, `evaluate.py` and its helps to assist in diagnosing problems and benchmarking solutions such that future decisions and analysis can be confidently made.
+3. The production of tools such as `explore.py`, `evaluate.py` and its helpers to assist in diagnosing problems and benchmarking solutions such that future decisions and analysis can be confidently made.
 4. Constructing `predict.py` as well as drafting much of the initial feasibility report
 5. Drafting this README report based on visual and quantitative data produced by the model.
 6. Explaining core concepts throughout the entire process to provide an overview of the specific concept, such as Autoencoders, codebook collapse or SSIM, for consolation rather than reading in depth scientific papers.
