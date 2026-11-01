@@ -16,16 +16,58 @@ _Figure 1: Baseline VAE and selected VQ-VAE architecture._
 
 ## 2. Feasibility Review
 
-### Scope and acceptance criteria
+### User need
+
+Medical imaging research is constrained by stringent patient data privacy laws (HIPAA, GDPR) and limited clinical scan availability. Generative models allow synthesizing realistic synthetic cohorts for data augmentation and anonymized multi-centre sharing. However, healthcare synthesis carries unique hazards: the model must preserve authentic physiological tissue boundaries without mode collapse, and must not hallucinate anatomically impossible structures or memorize training scans (which would violate patient confidentiality).
+
+The intended user is a medical imaging researcher or machine learning engineer evaluating whether synthetic images can supplement real HipMRI data. The prototype will implement a Vector-Quantised Variational Autoencoder (VQ-VAE) to generate synthetic 2D HipMRI slices and investigate the trade-off between image fidelity, sample diversity, and memorization of training data.
+
+The key dilemma is determining whether scans that are anatomical valid without becoming blurry or facing mode collapse, hallucinating physiologically impossible tissue junctions or non-existent pathologies and without producing verbatim memorization of training patient scans.
+
+If a generative model simply memorizes training scans, sharing the synthetic dataset constitutes an illegal breach of patient confidentiality. However, if it hallucinates unrealistic tissue structures, downstream models trained on it will learn hazardous diagnostic artefacts.
+
+### Scope
+
+The project is scoped to 2D HipMRI image generation using the provided `keras_slices_data` dataset. It will compare VQ-VAE against a simpler autoencoder baseline under consistent data splits and evaluation conditions.
+
+### Acceptance criteria
 
 The prototype is limited to 2D HipMRI generation. Both models use the same patient-level data partitions and evaluation procedures.
 
 - [x] Train a VQ-VAE that reconstructs HipMRI slices.
 - [x] Generate new samples by sampling discrete latent codes from a learned prior.
 - [x] Exceed the SSIM target of `0.6` on held-out paired reconstructions.
+- [x] Achieve an SSIM similar to that of held-out references in generated samples.
 - [x] Compare the VQ-VAE with a simpler generative baseline using the same data splits.
 - [x] Inspect uncurated samples, latent interpolations, and nearest training neighbours for diversity, anatomical plausibility, and possible memorisation.
 - [x] Measure parameter count, training time, peak accelerator memory, and generation latency.
+
+### Dataset Configuration
+
+**Data:** HipMRI 2D slices
+
+The project will use the provided HipMRI 2D slices from keras_slices_data, available through the COMP3710 project environment. Images will be loaded, checked for corrupted or inconsistent dimensions, and normalized to a consistent intensity range suitable for the selected reconstruction loss.
+
+The dataset will be divided into training, validation, and test sets before model training. Where patient identifiers or source-volume information are available, slices from the same patient or volume will be kept within a single split to reduce data leakage. The training set will be used to learn model parameters, the validation set to select configurations and checkpoints, and the test set reserved for final evaluation.
+
+### Model Architecture and Difficulty
+
+**Model:** Vector-Quantised Variational Autoencoder (VQ-VAE) + Autoregressive Prior
+**Difficulty band:** Hard Difficulty
+
+VQ-VAE uses an encoder to map an image into a lower-dimensional latent representation. The representation is quantized by assigning latent vectors to entries in a learned discrete codebook. A decoder then reconstructs the image from the quantized representation. The training objective combines reconstruction loss with terms that train the codebook and encourage the encoder to use its discrete representations effectively.
+
+The discrete latent representation provides a way to learn recurring image structures, but it can also introduce reconstruction artefacts or under-use of the codebook. These behaviours will be investigated through reconstruction comparisons, codebook usage statistics, and generated sample grids.
+
+The implementation will use PyTorch and run on the Rangpur A100 GPU cluster. The architecture will begin with a relatively small convolutional encoder and decoder, with the latent dimensionality, codebook size, and reconstruction objective selected to suit the resolution and characteristics of the dataset.
+
+### Relevant Course Concepts and Literature
+
+The project applies convolutional neural networks, representation learning, encoder-decoder architectures, reconstruction losses, latent representations, optimization, validation, and quantitative model evaluation.
+
+The assessment specification identifies VQ-VAE as a Hard Difficulty model for HipMRI 2D slices and cites "Neural discrete representation learning" by NeurIPS (2017). A basic autoencoder will provide the required simpler generative baseline. The comparison will examine whether discrete latent quantization provides useful improvements in image structure and diversity relative to the simpler model.
+
+The central research question is whether VQ-VAE can generate anatomically plausible and sufficiently diverse synthetic images without reproducing training examples. The final recommendation will be based on experimental evidence rather than visual quality alone.
 
 ### Preliminary evidence
 
@@ -33,7 +75,7 @@ The initial Rangpur audit inspected `25,320` NIfTI files. All were readable `flo
 
 A small deterministic autoencoder smoke test verified loading, forward and backward passes, finite losses, GPU execution, reconstruction, and checkpoint save/load. It preserved large anatomical features but blurred fine detail. This established that the pipeline worked; it did not establish generative ability, because a deterministic autoencoder does not learn a sampling distribution. The final baseline was therefore upgraded to a VAE.
 
-The initial compute plan reserved **6–12 GPU hours on Rangpur** for data preparation, smoke tests, experiments, and final evaluation. This was a planning estimate, not a measured runtime. The final measured training times are reported in Section 7.
+The initial compute plan reserved **6–12 GPU** for data preparation, smoke tests, experiments, and final evaluation. This was a planning estimate, not a measured runtime. The final measured training times are reported in Section 7.
 
 ### Main risks and fallback
 
@@ -60,11 +102,17 @@ _Figure 2: Representative slices from the training, validation, and test partiti
 
 ### Preprocessing
 
-Each slice is clipped to its 1st and 99.5th intensity percentiles, then scaled to `[0, 1]`:
+In `normalize_mri` from `dataset.py`, each slice is clipped to its 1st and 99.5th intensity percentiles, then scaled to `[0, 1]`:
 
 ```python
+"""Per-slice scaling to [0, 1] after clipping to the 1st-99.5th percentile.
+
+Clipping stops a few very bright voxels from compressing the useful range, and
+per-slice scaling removes the arbitrary absolute intensity scale between scans.
+"""
 low, high = np.percentile(array, [1.0, 99.5])
 if high <= low:
+    # constant slice: nothing to scal
     return np.zeros_like(array, dtype=np.float32)
 return ((np.clip(array, low, high) - low) / (high - low)).astype(np.float32)
 ```
@@ -113,6 +161,14 @@ Generation begins with a beginning-of-sequence token and predicts 512 code indic
 - Early VAE prior samples were mostly texture. The final VAE uses a 256-dimensional global latent representation and a full-covariance Gaussian fitted to training latents.
 - Early VQ-VAE samples had locally plausible texture but inconsistent global anatomy. The final model increased the code grid to `32 × 16`, expanded the codebook to 512 entries, added residual blocks and a six-layer causal transformer, and used validation-based early stopping.
 - The final VQ-VAE reconstruction loss includes SSIM with weight `0.1`; this improved local structure in the sample grids but does not establish anatomical validity.
+
+### Training Pipeline and Stability
+
+The training pipeline uses different objectives for the continuous VAE baseline and the discrete VQ-VAE architecture. The VAE is optimised using reconstruction MSE and KL-divergence regularisation. The VQ-VAE combines reconstruction MSE, an SSIM-based structural loss and commitment loss, with its codebook updated using exponential moving averages rather than ordinary optimiser gradients.
+
+The VQ-VAE training procedure monitors reconstruction and validation losses, gradient norms, codebook utilisation and perplexity to identify optimisation instability and codebook collapse. The autoregressive transformer prior is trained separately using next-token cross-entropy, AdamW, learning-rate warm-up and cosine decay, with early stopping based on validation cross-entropy.
+
+The later training curves and three-seed experiments provide evidence of optimisation behaviour and configuration sensitivity. However, declining gradient norms and sustained codebook utilisation do not independently establish complete numerical stability or convergence.
 
 ## 5. Installation, Reproducibility, and Usage
 
@@ -198,7 +254,13 @@ The final comparison uses the same patient-level manifest and random seed `42`; 
 
 _Figure 3: Training losses, validation SSIM, reconstruction MSE, gradient norms, codebook use, and learning rate._
 
-The VQ-VAE achieved higher validation SSIM and lower reconstruction MSE. Its gradient norms declined during training, and nearly all codebook entries were used. Total loss values are not directly comparable because the VAE includes KL regularisation while the VQ-VAE includes codebook and commitment terms.
+Training stability was assessed using finite-loss checks, epoch-to-epoch loss changes, gradient norms, gradient clipping frequency, validation performance, and VQ-VAE codebook utilisation. The autoregressive prior was evaluated separately using training and validation cross-entropy.
+
+Both autoencoders completed 50 training epochs without non-finite losses or loss spikes exceeding a 50% increase between consecutive epochs. Neither required gradient clipping. Mean pre-clipping gradient norms were 0.01 for the VAE and 0.08 for the VQ-VAE. Validation SSIM fluctuations during the final ten epochs were also small, with standard deviations of successive changes of 0.0002 and 0.0001, respectively.
+
+The VQ-VAE's detailed training history shows that its reconstruction quality improved throughout training. Validation MSE decreased from 0.00286 to 0.000958, while validation SSIM increased from 0.842 to 0.941. Gradient norms declined from 0.338 to 0.016, without any clipping events. Although the total validation loss increased after reaching its minimum at epoch 5, this occurred alongside improving reconstruction metrics and increasing codebook and commitment losses, indicating a trade-off between objective components rather than numerical divergence.
+
+Codebook utilisation also remained healthy. Active training entries increased from approximately 191 to all 512 entries, with final training and validation perplexities of approximately 390 and 394, respectively. This provides no evidence of severe codebook collapse.
 
 ![Transformer prior training curves](images/evaluation_prior_training.png)
 
@@ -228,7 +290,7 @@ The VAE produces recognisable MRI-like images but often blurs tissue boundaries.
 |---|---:|---:|---:|
 | Test reconstruction SSIM | `0.713` | `0.950` | — |
 | Best-match SSIM to training images | `0.293` | `0.341` | `0.343` |
-| Fréchet distance (Inception-v3 features; lower is better) | `~226` | `75.14` | `51.59` |
+| Fréchet distance (Inception-v3 features; lower is better) | `226.32` | `75.14` | `51.59` |
 
 Both models exceed the `0.6` target on **paired test reconstructions**. The VQ-VAE also has a substantially lower Fréchet distance than the VAE, although its distance remains higher than the real-versus-real reference. Precision, recall, density, and coverage also favoured the VQ-VAE, particularly recall, but its precision, density, and coverage remained below the held-out real reference.
 
@@ -260,15 +322,25 @@ Use is non-uniform, but activity across nearly all 512 entries and the reported 
 
 _Figure 10: Generated-sample distances and similarities compared with training and held-out real images._
 
-VQ-VAE mean best-match SSIM to training images was `0.341`, close to `0.343` for held-out real images. Nearest-neighbour examples show differences in tissue patterns, boundaries, and intensities rather than exact copies. The train-versus-test distance plot shows a slight tendency for generated samples to be closer to a training neighbour; it does not show obvious systematic pixel-level copying. These are checks for visible similarity, not a formal privacy guarantee.
+VQ-VAE mean best-match SSIM to training images was `0.341`, close to the `0.343` for held-out real images. Furthermore, the train-versus-test distance plot shows a slight tendency for generated samples to be closer to a training neighbour, however, it does not show obvious systematic pixel-level copying. 
+
+The nearest-neighbour analysis also found no obvious systematic pixel-level copying in the inspected generated samples. The mean best-match SSIM for VQ-VAE generations was comparable to that of held-out real images against the training set, providing a useful reference for naturally occurring anatomical similarity.
+
+However, these measurements are screening evidence rather than a formal privacy assessment. Similarity-based comparisons cannot establish the absence of patient information, membership inference risk or patient re-identification. The results therefore support the conclusion that obvious training-image duplication was not observed, but do not establish that the generated dataset is anonymous or privacy-preserving.
 
 ![VQ-VAE generated samples and their nearest training neighbours](images/evaluation_closest_to_training_vqvae.png)
 
 _Figure 11: VQ-VAE samples, nearest training slices, and difference maps._
 
+The VQ-VAE's six closest training-slice matches exhibit measurable pixel-level and structural differences. Their anatomical similarities are consistent with learning shared MRI characteristics rather than simply reproducing individual training examples.
+
+The closest matches had pixel MSE values between `0.00918` and `0.01217`, with SSIM values ranging from `0.386` to `0.478`. Visual inspection of the generated images, nearest training slices and absolute difference maps revealed no obvious exact or near-identical reproductions. Although the images share common anatomical structures, differences remain in tissue patterns, anatomical boundaries, structural positioning and intensities.
+
+The results are encouraging, particularly because the audit examines the closest matches rather than randomly selected generations. Nevertheless, the relatively small number of inspected examples and the absence of a formal patient-level privacy assessment prevent a definitive conclusion that memorisation has been eliminated.
+
 ### Failure-case autopsy
 
-The following five VQ-VAE samples were selected automatically using diagnostic criteria, not hand-picked examples. Each is compared with its nearest training slice in the failure figure. The metrics identify observable image defects; they are not clinical diagnoses.
+The following five VQ-VAE samples were selected automatically using diagnostic criteria, not hand-picked examples. Each is compared with its nearest training slice in the failure figure . The metrics identify observable image defects; they are not clinical diagnoses.
 
 ![Automatically selected VQ-VAE failure cases and nearest training slices](images/evaluation_failure_autopsy_vqvae.png)
 
@@ -276,13 +348,67 @@ _Figure 12: Five automatically selected VQ-VAE generation failures, nearest trai
 
 | Failure mode | Generated sample | Diagnostic evidence | Nearest training case | SSIM |
 |---|---|---|---|---|
-| High-frequency / checkerboard artefact | Seed 2, sample 25 | Nyquist-corner energy `0.00008`, above the real-data 95th percentile (`0.000025`) | `case_015` | `0.37` |
+| High-frequency / checkerboard artefact | Seed 2, sample 25 | Nyquist-corner energy `0.00008`, above the real-data 95th percentile (`0.00025`) | `case_015` | `0.37` |
 | Fragmented tissue margin | Seed 1, sample 15 | Body-mask fragmentation `0.74` across 21 components; real-data 95th-percentile fragmentation was `0.76` | `case_019` | `0.22` |
 | Off-manifold anatomy | Seed 4, sample 8 | Mean 5-NN feature distance `14.2`, versus cohort median `10.6` | `case_012` | `0.25` |
 | Blur / lost detail | Seed 1, sample 17 | Laplacian variance `0.00605`, below the real-data median (`0.02`) | `case_027` | `0.46` |
 | No close anatomical match | Seed 1, sample 3 | Best SSIM to any training slice was `0.18` | `case_023` | `0.18` |
 
-The cases expose different failure mechanisms: high-frequency artefacts, disconnected body regions, feature-space outliers, loss of fine detail, and outputs with no close training analogue. Nearest-neighbour similarity alone cannot determine whether an outlier is novel or anatomically invalid, so the images require expert review before any clinical interpretation.
+**Root-trigger analysis**
+
+1. High-frequency / checkerboard artefact (Seed 2, sample 25)
+
+The visible high-frequency artefacts may originate from interactions between discrete latent quantisation and decoder reconstruction. The encoder compresses the input into a 32 × 16 code grid, where abrupt changes between neighbouring codebook entries may introduce local discontinuities during decoding. Alternatively, the autoregressive prior may generate locally inconsistent combinations of otherwise valid codes. Although the decoder uses nearest-neighbour upsampling to reduce conventional transposed-convolution checkerboard artefacts, this does not prevent other periodic reconstruction patterns. The SSIM-weight experiments indicate that reconstruction sharpness is sensitive to the loss balance; however, the measured Nyquist-corner energy of `0.00008` is below the real-data 95th percentile of `0.00025`, so the spectral measurement does not independently confirm an unusually strong high-frequency component.
+
+2. Fragmented tissue margin (Seed 1, sample 15)
+
+The fragmented tissue boundaries may result from insufficient spatial detail in the quantised latent representation. Compressing the 128 × 64 input into a 32 × 16 grid can discard fine anatomical structures, while assigning encoder features to discrete codebook entries introduces additional representational approximation. The autoregressive prior may also contribute because its next-token objective learns code dependencies without explicitly enforcing anatomical connectivity. The downsampling experiments support the importance of preserving spatial resolution: increasing the number of downsampling stages from two to three substantially degraded reconstruction SSIM from `0.9245` to `0.7754`. However, the measured fragmentation score of `0.74` remains below the real-data 95th percentile of `0.76`, so the diagnostic alone does not establish unusually severe fragmentation.
+
+3. Off-manifold anatomy (Seed 4, sample 8)
+
+The unusual anatomical arrangement may indicate that the autoregressive prior has not fully learned the global dependencies between spatially related latent codes. Although its six transformer blocks model preceding tokens through causal attention, the next-token cross-entropy objective does not explicitly constrain the resulting images to follow anatomically plausible global structures. Consequently, locally plausible code selections may combine into atypical anatomical arrangements. The sample's mean five-nearest-neighbour feature distance of `14.2`, compared with the cohort median of `10.6`, supports its identification as a feature-space outlier. Prior validation cross-entropy also plateaued at approximately epoch 10, suggesting limited further improvement in modelling code dependencies. Healthy codebook utilisation, however, makes severe codebook collapse an unlikely explanation.
+
+4. Blur / lost detail (Seed 1, sample 17)
+
+The reduced image detail is consistent with information loss through the encoder's spatial compression and vector quantisation. Fine anatomical boundaries and intensity variations may not be retained in the 32 × 16 latent representation, leaving the decoder unable to reconstruct details that were discarded during encoding. The reconstruction objective may reinforce this effect because pixel-wise MSE does not specifically preserve high-frequency detail. Supporting this explanation, increasing the SSIM loss weight from `0` to `0.1` improved the sharpness ratio from approximately `0.604` to `0.763`, while increasing codebook size from `512` to `1024` also improved reconstruction sharpness. The sample's Laplacian variance of `0.00605`, substantially below the real-data median of `0.02`, provides quantitative evidence of reduced detail.
+
+5. No close anatomical match (Seed 1, sample 3)
+
+The low best-match SSIM of `0.18` may result from stochastic sampling of the autoregressive prior producing a latent-code sequence substantially different from those observed in individual training examples. Because predictions are conditioned on preceding tokens, differences in earlier code selections can influence the composition of the remaining sequence, introducing anatomical variations that may improve diversity but also produce atypical structures. However, low nearest-neighbour similarity is not necessarily a generation failure: it may indicate useful novelty rather than anatomical implausibility or memorisation avoidance alone. This sample should therefore be treated as a low-similarity outlier rather than a confirmed anatomical failure. Additional feature-space comparisons against held-out real images and anatomical plausibility inspection would be needed to distinguish useful diversity from an invalid generation.
+
+**Overall interpretation**
+
+The five cases suggest that generation quality is influenced by both the discrete autoencoder and the autoregressive prior. High-frequency artefacts and loss of detail are consistent with limitations in quantised spatial representation and decoder reconstruction, while fragmented boundaries may reflect inadequate preservation of spatial continuity. Off-manifold anatomy is more directly consistent with imperfect modelling of global code dependencies by the autoregressive prior. A generation with no close training neighbour, however, cannot be classified as defective on similarity alone.
+
+The later hyperparameter experiments provide supporting architectural evidence. Increasing the SSIM loss weight improved reconstruction sharpness, increasing codebook size improved several reconstruction and distributional measures, and additional downsampling substantially degraded image quality. These results suggest that preserving latent spatial resolution and balancing reconstruction and structural objectives are important for generation quality. Nevertheless, the experiments do not isolate the causes of individual failure cases. Controlled comparisons between reconstructed and prior-generated samples are required to distinguish decoder and quantisation limitations from errors introduced by autoregressive sampling.
+
+### Distinguishing Reconstruction and Generative Fidelity
+
+![Metric Comparison](images/evaluation_metric_comparison.png)
+
+_Figure 13 - Metric Comparision_
+
+The SSIM acceptance threshold of 0.6 is evaluated using paired held-out test reconstructions. Both the VAE and VQ-VAE exceed this threshold, demonstrating that their respective decoders preserve substantial structural information from their input slices.
+
+This result should not be interpreted as demonstrating equivalent similarity for prior-generated synthetic images. Generated-image fidelity and diversity are evaluated separately using feature-space Fréchet distance, precision, recall, coverage and nearest-neighbour similarity. These metrics compare properties of generated and real cohorts rather than the reconstruction accuracy of individual input images.
+
+The VQ-VAE achieves a lower Inception-v3 feature-space Fréchet distance than the VAE, indicating a closer generated distribution under the selected evaluator. Nevertheless, the remaining difference from the held-out real-data reference demonstrates that the generated distribution is not equivalent to the real distribution.
+
+### Latent-space interpolation
+
+![VQ-VAE latent-space interpolation](images/version7_vq-vae_latent_interpolation.png)
+
+_Figure 14: VQ-VAE - Latent-space interpolation between a training image and a synthetic image_
+
+To investigate the structure of the learned latent representation, linear interpolation was performed between two encoded HipMRI slices. Intermediate latent representations were generated at nine interpolation coefficients, ranging from α = 0.00 to α = 1.00, and decoded using the VQ-VAE decoder.
+
+For linear interpolation, the intermediate representation is calculated as:
+
+`z_alpha = (1 - alpha) * z_start + alpha * z_end`
+
+The resulting sequence demonstrates a gradual transition between the endpoint images. The prominent high-intensity anatomical structure remains recognisable throughout the interpolation, while surrounding tissue patterns, boundaries and intensity distributions change progressively. No obvious abrupt structural discontinuities are apparent at the sampled interpolation points.
+
+These results provide qualitative evidence that the learned latent representation captures variations between the selected anatomical images rather than restricting reconstruction to the original endpoints. However, smooth visual transitions do not independently establish anatomical validity, and the experiment examines only one interpolation path rather than the structure of the entire latent space. 
 
 ### Computational profile
 
@@ -290,17 +416,22 @@ Computational profiling was performed on an Apple M5 Pro (64 GiB unified memory)
 
 | Metric | VAE | VQ-VAE |
 |---|---:|---:|
-| Trainable parameters | 3.55M | 7.02M |
+| Autoencoder parameters | 3.55M | 2.00M |
+| Prior parameters | — | 5.01M |
+| Total parameters | 3.55M | 7.02M |
 | Resident weights | 13.6 MiB | 27.0 MiB |
 | Peak reconstruction memory (batch 64) | 40.7 MiB | 226.1 MiB |
 | Peak training-step memory (batch 64) | 229.1 MiB | 2,285.5 MiB |
 | Training-step latency (batch 64) | 23.8 ms | 172.7 ms |
-| Generation latency (batch 1) | 0.44 ms | 636.9 ms |
-| Generation throughput (batch 64) | 15,780.6 images/s | 32.0 images/s |
+| Autoencoder training time | 19.25 min | 85.53 min |	
+| Total training time (including prior) | 19.25 min | 174.86 min |	
+| Test reconstruction latency | 0.809 ms/sample | 0.955 ms/sample |
+| Generation latency | 1.687 ms/sample | 137.439 ms/sample |
+| Generation runtime (64 samples) | 0.108 s | 8.796 s |	
 
-The VAE was substantially more computationally efficient, requiring approximately one-tenth of the VQ-VAE's peak training-step memory and completing a batch-64 training step around 7.3 times faster. The VQ-VAE's autoregressive transformer prior is the main computational bottleneck: sampling 512 latent codes takes approximately 663 ms per image, compared with 0.99 ms for the decoder alone. Prior training is particularly memory-intensive, reaching approximately 13 GiB at batch size 64.
+The results show that while the VQ-VAE has a smaller autoencoder (43.7% fewer parameters), its additional prior network increases the total parameter count by 97.7% compared with the standard VAE. This also results in substantially higher memory requirements, with peak reconstruction and training memory increasing by 5.56× and 9.98×, respectively. The VQ-VAE also has a considerably higher training-step latency (7.26× slower), although test reconstruction latency is relatively similar, with only an 18% increase. The most significant difference is generation speed: the VQ-VAE is approximately 81.5× slower due to the additional computational cost of its prior-based generation process. Overall, the VAE offers substantially better computational and memory efficiency, while the VQ-VAE introduces significant overhead, particularly during training and generation.
 
-Both models completed the measured operations, but these benchmarks do not establish training convergence or numerical stability. The higher VQ-VAE training latency and memory requirements make it more sensitive to batch size and available unified memory. Its autoregressive generation also limits practical sampling throughput. These costs should be considered when selecting batch sizes, planning experiments, and generating synthetic datasets. MPS memory measurements are approximate, include allocator caching where reported by the driver, and may vary with system memory pressure and thermal conditions.
+The higher VQ-VAE training latency and memory requirements make it more sensitive to batch size and available unified memory. Its autoregressive generation also limits practical sampling throughput. These costs should be considered when selecting batch sizes, planning experiments, and generating synthetic datasets. MPS memory measurements are approximate, include allocator caching where reported by the driver, and may vary with system memory pressure and thermal conditions.
 
 ## 7. Hyperparameter Experiments and Further Actions
 
@@ -370,7 +501,7 @@ Close-match rate is a useful screening measure, not a privacy guarantee. Best-ma
 
 Differences should be interpreted in relation to the reported seed variability. Three repeats provide an initial estimate of stability, not a definitive statistical comparison. Generation metrics and the selected checkpoint should be re-evaluated on a larger sample before drawing conclusions about memorisation, diversity, or clinical suitability.
 
-### 5. Future actionable experiment recommendations beyond the scope of this report
+### 5. Actionable Recommendations
 
 The current configuration (`codebook_size=512`, `ssim_weight=0.1`, and two downsampling stages) provides a useful reference for controlled follow-up experiments. The sweeps suggest the following changes for further investigation:
 
@@ -380,51 +511,53 @@ The current configuration (`codebook_size=512`, `ssim_weight=0.1`, and two downs
 
 3. **Retain two downsampling stages.** Three stages increased parameter count from approximately 2.0M to 7.9M and degraded reconstruction and several generation metrics. Further architecture changes should focus on preserving spatial detail and avoiding artefacts rather than simply increasing depth.
 
-4. **Evaluate the combined configuration.** The next experiment should combine `codebook_size=1024`, `ssim_weight=0.05`, and `downsample_stages=2`. This configuration combines promising results from the individual sweeps, but the joint effect is unknown because the hyperparameters were varied separately. Train it with the same data split, epoch budget, and seeds as the reference model. Compare the combined model against the current configuration and the best individual alternatives before accepting the change.
+4. **Evaluate the combined configuration.** The next experiment should combine `codebook_size=1024`, `ssim_weight=0.05`, and `downsample_stages=2`. This configuration combines promising results from the individual sweeps, but the joint effect is unknown because the hyper-parameters were varied separately. Train it with the same data split, epoch budget, and seeds as the reference model. Compare the combined model against the current configuration and the best individual alternatives before accepting the change.
 
-5. **Strengthen memorisation and privacy evaluation.** Run the full nearest-neighbour audit using `evaluate.py` on uncurated generated samples. Examine the closest training matches individually, compare similarity distributions rather than only a single threshold, and investigate whether particular patients or anatomical regions are disproportionately represented. Where feasible, add patient-level privacy tests and confirm that improvements persist across seeds.
+5. **Prioritise anatomical plausibility and downstream safety.** Inspect uncurated sample grids, latent-space interpolations, and automatically flagged failures. Review tissue boundaries, spatial continuity, implausible structures, and artefacts with appropriate domain expertise. Where segmentation labels are available, assess anatomical consistency against them. Before using synthetic images for downstream training, compare downstream performance using real-only, synthetic-only, and mixed training data, and evaluate performance on held-out real patients, including relevant subgroup and pathology-specific analyses where the dataset supports them.
 
-6. **Prioritise anatomical plausibility and downstream safety.** Inspect uncurated sample grids, latent-space interpolations, and automatically flagged failures. Review tissue boundaries, spatial continuity, implausible structures, and artefacts with appropriate domain expertise. Where segmentation labels are available, assess anatomical consistency against them. Before using synthetic images for downstream training, compare downstream performance using real-only, synthetic-only, and mixed training data, and evaluate performance on held-out real patients, including relevant subgroup and pathology-specific analyses where the dataset supports them.
-
-7. **Validate reproducibility and distributional metrics.** Increase the number of repeats and generated samples, report uncertainty, and retain the best checkpoint selected using validation data. Keep the test set reserved for final evaluation. Reassess FD, precision, recall, coverage, sharpness, close-match rate, and prior validation CE together rather than optimising a single metric.
+6. **Validate reproducibility and distributional metrics.** Increase the number of repeats and generated samples, report uncertainty, and retain the best checkpoint selected using validation data. Keep the test set reserved for final evaluation. Reassess FD, precision, recall, coverage, sharpness, close-match rate, and prior validation CE together rather than optimising a single metric.
 
 These experiments would test whether the modest improvements observed in individual sweeps transfer to a combined model and whether they improve the properties that matter for safe synthetic medical imaging. A configuration should only be recommended for downstream training after demonstrating adequate anatomical plausibility, useful sample diversity, acceptable similarity to training data, and performance on held-out real data. The present results motivate these investigations but do not establish that any configuration is clinically safe or privacy-preserving.
 
 
-## 8. Discussion and Recommendation
+## 8. Discussion and Conclusion
 
 The VQ-VAE is the stronger model on this dataset: it improves reconstruction SSIM from `0.713` to `0.950`, reduces Fréchet distance from approximately `226` to `75.14`, and uses almost the entire codebook. Its feature distribution is closer to real HipMRI than the VAE's, but it remains different from the held-out real reference and still produces occasional artefacts.
 
-The gain has a substantial cost: the VQ-VAE has nearly twice as many trainable parameters, takes about nine times longer to train, and has about 263 times the generation latency. This may be acceptable for small research cohorts, but is inefficient for high-throughput generation without prior optimisation.
+The gain has a substantial cost: the VQ-VAE has nearly twice as many trainable parameters, takes about nine times longer to train, and has about `81.5` times the generation latency. This may be acceptable for small research cohorts, but is inefficient for high-throughput generation without prior optimisation.
 
 The findings have important limits:
 
-- **Generalisation:** only 38 patients were available, with three in the held-out test partition. Independent patients and imaging centres are needed for stronger generalisation evidence.
+- **Generalisation:** only 38 patients were available, with three in the held-out test partition. Independent patients and imaging centers are needed for stronger generalisation evidence.
 - **Anatomical validity:** no expert clinical review was performed. MSE, SSIM, Inception features, frequency measures, and t-SNE cannot establish physiological correctness.
 - **Privacy:** no differential-privacy mechanism, membership-inference test, or patient re-identification evaluation was performed. Nearest-neighbour differences do not prove anonymity or safe sharing.
 - **Volumetric consistency:** the model generates independent 2D slices and does not enforce continuity between adjacent slices.
 - **Downstream utility:** the project did not test whether synthetic images improve a model trained for a medical-imaging task. A future study should compare downstream performance on held-out real patients with and without synthetic augmentation.
 
-**Recommendation:** retain the VQ-VAE as the preferred experimental architecture for further research, but treat its outputs as research prototypes only. Do not regard them as clinically validated or privacy-guaranteed data. Before downstream use or sharing, obtain expert anatomical review, test patient-level generalisation and privacy risk, and evaluate utility on a separate task using held-out real patients. Optimising the autoregressive prior should be a priority if generation throughput matters.
+### Conclusion
+
+Retain the VQ-VAE as the preferred experimental architecture for further research, but treat its outputs as research prototypes only. Do not regard them as clinically validated or privacy-guaranteed data. Before downstream use or sharing, obtain expert anatomical review, test patient-level generalisation and privacy risk, and evaluate utility on a separate task using held-out real patients. Optimising the autoregressive prior should be a priority if generation throughput matters.
 
 ## 9. Artificial Intelligence Usage Disclosure
 
+I personally take 100% responsibility for every line of code, loss formula, and metric in this submission. While AI was used in the submission, the final decisions were left to myself to approve/disapprove and therefore so does the responsibility for the work.
+
 ### Tools used
 
-Claude (Anthropic) was used throughout this project to assist in the generation of code for the models, figures and results mentioned throughtout this report based on human decisions as described by the changelog. ChatGPT was used in explaing concepts and results where no code needed to be generated.
+Claude (Anthropic) was used throughout this project to assist in the generation of code for the models, figures and results mentioned throughout this report based on human decisions as described. ChatGPT was used in explain concepts and results where no code needed to be generated.
 
 ### Tasks supported by AI
 
-1. Initial scaffolding and implementation of `modules.py` and `dataset.py`, and the `train.py` training loop base on desisions made in the initial feasability specification.
+1. Initial scaffolding and implementation of `modules.py` and `dataset.py`, and the `train.py` training loop base on decisions made in the initial feasibility specification.
 2. Iterations on the initial model designs including converting the baseline model from an AE to VAE.
 3. The production of tools such as `explore.py`, `evaluate.py` and its helps to assist in diagnosing problems and benchmarking solutions such that future decisions and analysis can be confidently made.
-4. Constructing `predict.py` as well as drafting much of the initial feasability report
-5. Drafting this README report based on visual and quantitaive data produced by the model.
-6. Explaning core concepts throught the entire process to provide an overview of the specific concept, such as Autoencoders, codebook collapse ot SSIM, for consolation rather than reading in depth scientific papers.
+4. Constructing `predict.py` as well as drafting much of the initial feasibility report
+5. Drafting this README report based on visual and quantitative data produced by the model.
+6. Explaining core concepts throughout the entire process to provide an overview of the specific concept, such as Autoencoders, codebook collapse or SSIM, for consolation rather than reading in depth scientific papers.
 
 ### Review and verification
 
-All code was manually reviewed ensuring that there were no obvious bugs or inaccuracies while ensuring strict version control so, that if any issues were later found to be introduced by the foreign code, changes can be rolled back to the last stable version. The models were then verified based on visual sample reconstruction and generations to ensure that the outputed samples match what is suggested by the numerical results. Finally, solutions to issues proposed to the AI model where tested to determing wheither the casue of the issue was identified or whether the changes made did not address the original issue. The original figures were refenced to ensure that all results matched the model output rather than being haloosinated by the LLM.
+All code was manually reviewed ensuring that there were no obvious bugs or inaccuracies while ensuring strict version control so, that if any issues were later found to be introduced by the foreign code, changes can be rolled back to the last stable version. The models were then verified based on visual sample reconstruction and generations to ensure that the outputted samples match what is suggested by the numerical results. Finally, solutions to issues proposed to the AI model where tested to determining whether the cause of the issue was identified or whether the changes made did not address the original issue. The original figures were referenced to ensure that all results matched the model output rather than being hallucinated by the LLM.
 
 ## 10. References
 
