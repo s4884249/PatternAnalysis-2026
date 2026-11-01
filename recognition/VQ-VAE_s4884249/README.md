@@ -491,7 +491,7 @@ Two downsampling stages substantially outperformed three in reconstruction quali
 
 The two-stage architecture should therefore remain the default. A deeper encoder-decoder is not justified by these results, although the lower close-match rate at three stages warrants further investigation rather than being interpreted as conclusive evidence of improved privacy.
 
-### 4. Interpretation and limitations
+### Interpretation and limitations
 
 The sweeps reveal trade-offs between reconstruction fidelity, sample diversity, distributional similarity, and potential memorisation. Although all configurations exceeded the reconstruction SSIM threshold, none provided uniformly improved results that would justify an imediate change to the model configuration.
 
@@ -501,7 +501,7 @@ Close-match rate is a useful screening measure, not a privacy guarantee. Best-ma
 
 Differences should be interpreted in relation to the reported seed variability. Three repeats provide an initial estimate of stability, not a definitive statistical comparison. Generation metrics and the selected checkpoint should be re-evaluated on a larger sample before drawing conclusions about memorisation, diversity, or clinical suitability.
 
-### 5. Actionable Recommendations
+### Actionable Recommendations
 
 The current configuration (`codebook_size=512`, `ssim_weight=0.1`, and two downsampling stages) provides a useful reference for controlled follow-up experiments. The sweeps suggest the following changes for further investigation:
 
